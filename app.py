@@ -14,7 +14,7 @@ FREQ = 2.4
 D_STEP = 800        
 
 # Initialize Session State
-if 'center' not in st.session_state: st.session_state.center = [33.6644, -84.0113]
+if 'center' not in st.session_state: st.session_state.center = [34.066, -84.677] # Default Acworth area
 if 'vault' not in st.session_state: st.session_state.vault = []
 if 'manual_obs' not in st.session_state: st.session_state.manual_obs = []
 if 'staged_obs' not in st.session_state: st.session_state.staged_obs = None
@@ -43,44 +43,50 @@ def calculate_rf(dist_ft, h_tx, h_rx, obs_msl):
 with st.sidebar:
     st.title("🛰️ Site Loadout")
     
-    # UPGRADED SEARCH ENGINE (ArcGIS)
-    query = st.text_input("1. Find Site (Address or Lat, Lon)", placeholder="e.g. 123 Main St or 33.6, -84.0")
+    query = st.text_input("1. Find Site (Address or Lat, Lon)", placeholder="e.g. 4415 Center St, Acworth, GA")
     
     if st.button("📍 Locate & Fetch Boundary"):
         try:
+            # FIX: Only try float conversion if a comma exists AND it looks like numbers
+            is_coord = False
             if "," in query:
-                lat, lon = map(float, query.split(","))
-                st.session_state.center = [lat, lon]
-            else:
-                # Using ArcGIS Service (No Key needed for simple Find)
+                parts = query.split(",")
+                try:
+                    lat, lon = float(parts[0]), float(parts[1])
+                    st.session_state.center = [lat, lon]
+                    is_coord = True
+                except ValueError:
+                    is_coord = False # It's a street address with a comma (e.g. "Acworth, GA")
+
+            if not is_coord:
+                # Use ArcGIS for Address strings
                 arcgis_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={query}&maxLocations=1"
                 res = requests.get(arcgis_url, timeout=5).json()
                 if res.get('candidates'):
                     loc = res['candidates'][0]['location']
                     st.session_state.center = [loc['y'], loc['x']]
                 else:
-                    st.error("Address not found.")
-            
-            # Fetch Boundary Polygon (Nominatim with Custom User Agent)
+                    st.error("Address not found in database.")
+
+            # Fetch Boundary Polygon
             try:
-                geo = Nominatim(user_agent="dji_m4td_planner_pro_2026")
+                geo = Nominatim(user_agent="dji_m4td_survey_tool_2026")
                 res = geo.reverse(st.session_state.center, timeout=5)
                 if res:
                     osm_id = res.raw.get('osm_id')
                     osm_type = res.raw.get('osm_type')[0].upper()
                     poly_url = f"https://nominatim.openstreetmap.org/details?osmtype={osm_type}&osmid={osm_id}&format=json&polygon_geojson=1"
                     p_res = requests.get(poly_url, timeout=5).json()
-                    st.session_state.jurisdiction = {
-                        "name": res.raw.get('address', {}).get('city') or res.raw.get('address', {}).get('town', "Area Found"),
-                        "poly": p_res.get('geometry')
-                    }
+                    city_name = res.raw.get('address', {}).get('city') or res.raw.get('address', {}).get('town', "Area Found")
+                    st.session_state.jurisdiction = {"name": city_name, "poly": p_res.get('geometry')}
+                    st.toast(f"Matched Jurisdiction: {city_name}")
             except: 
-                st.session_state.jurisdiction = {"name": "Manual Boundary Only", "poly": None}
+                st.session_state.jurisdiction = {"name": "Manual Scan Only", "poly": None}
             
             st.session_state.map_v += 1
             st.rerun()
         except Exception as e:
-            st.error(f"Search failed: {e}")
+            st.error(f"Search error: {e}")
 
     st.divider()
     st.header("2. Manual Obstacle")
@@ -95,7 +101,7 @@ with st.sidebar:
         if st.button("❌ Cancel"):
             st.session_state.staged_obs = None
             st.rerun()
-    else: st.caption("Click map to select an obstacle.")
+    else: st.caption("Click map to select a building/tree.")
 
     st.divider()
     ant_h = st.number_input("Antenna AGL (ft)", 35.0)
@@ -103,7 +109,7 @@ with st.sidebar:
     clutter = st.slider("Global Clutter (ft)", 0, 100, 60)
     
     if st.button("🚀 RUN STRATEGIC SCAN"):
-        with st.spinner("Analyzing 16 Paths..."):
+        with st.spinner("Analyzing Paths..."):
             dock_g = get_elev_msl(st.session_state.center[0], st.session_state.center[1])
             h_tx, h_rx = dock_g + ant_h + 15, dock_g + drone_h
             
@@ -161,7 +167,7 @@ if out and out.get("last_clicked"):
     c_lat, c_lon = out["last_clicked"]["lat"], out["last_clicked"]["lng"]
     dist = geodesic(st.session_state.center, (c_lat, c_lon)).feet
     
-    # Calc Bearing & Snap
+    # Calc Direction
     dL = math.radians(c_lon - st.session_state.center[1])
     y = math.sin(dL) * math.cos(math.radians(c_lat))
     x = math.cos(math.radians(st.session_state.center[0])) * math.sin(math.radians(c_lat)) - \
