@@ -5,13 +5,14 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 from folium.features import DivIcon
 
-st.set_page_config(layout="wide", page_title="DJI M4TD Pro Planner")
+st.set_page_config(layout="wide", page_title="DJI M4TD Multi-Obstacle Planner")
 
 # --- 1. STATE INITIALIZATION ---
 dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 if 'vault' not in st.session_state:
-    st.session_state.vault = {d: {"dist": 150.0, "h": 60.0} for d in dirs}
+    # Now storing a LIST of obstacles for each direction
+    st.session_state.vault = {d: [] for d in dirs}
 if 'center_coord' not in st.session_state:
     st.session_state.center_coord = [33.66, -84.01]
 if 'last_click_dist' not in st.session_state:
@@ -21,7 +22,7 @@ if 'last_click_dist' not in st.session_state:
 def search():
     if st.session_state.addr_input:
         try:
-            loc = Nominatim(user_agent="dji_pro_manual_math").geocode(st.session_state.addr_input)
+            loc = Nominatim(user_agent="dji_multi_obs").geocode(st.session_state.addr_input)
             if loc: st.session_state.center_coord = [loc.latitude, loc.longitude]
         except: st.error("Search error.")
 
@@ -33,43 +34,41 @@ def get_city(lat, lon):
     except: return None
 
 # --- 3. UI & SIDEBAR ---
-st.title("📡 DJI Dock 3 / M4TD Pro Site Planner")
+st.title("📡 DJI M4TD Multi-Obstacle Precision Planner")
 st.text_input("Search Address", key="addr_input", on_change=search)
 
 with st.sidebar:
     st.header("Site Specs")
     b_h = st.number_input("Building Height (ft)", value=20)
     d_alt = st.slider("Drone Alt (ft AGL)", 100, 400, 200)
+    ant_total = b_h + 15
     
     st.divider()
-    st.subheader("Obstruction Targeting")
-    target_dir = st.selectbox("Assign to Direction:", dirs)
+    st.subheader("Add Obstruction")
+    target_dir = st.selectbox("Direction:", dirs)
     
     st.write(f"**Detected Distance:** {int(st.session_state.last_click_dist)} ft")
-    
-    # MANUAL MATH SECTION
-    st.write("---")
-    st.write(f"**{target_dir} Tree Height Calc (MSL)**")
-    ground_msl = st.number_input("Ground Elevation (MSL)", value=900.0, step=1.0)
-    top_msl = st.number_input("Tree Top Elevation (MSL)", value=960.0, step=1.0)
-    
-    calc_h = top_msl - ground_msl
-    st.info(f"Calculated Tree Height: **{int(calc_h)} ft**")
+    g_msl = st.number_input("Ground MSL", value=900.0)
+    t_msl = st.number_input("Top MSL", value=960.0)
+    calc_h = t_msl - g_msl
+    st.info(f"Tree Height: {int(calc_h)} ft")
 
-    if st.button(f"📌 Save Data to {target_dir}"):
-        st.session_state.vault[target_dir]["dist"] = round(st.session_state.last_click_dist, 1)
-        st.session_state.vault[target_dir]["h"] = calc_h
-        st.success(f"Saved {target_dir}!")
+    if st.button(f"➕ Add Obstacle to {target_dir}"):
+        new_obs = {"dist": round(st.session_state.last_click_dist, 1), "h": calc_h}
+        st.session_state.vault[target_dir].append(new_obs)
+        st.success(f"Added to {target_dir} list!")
 
     st.divider()
-    st.subheader("Vault Status")
+    st.subheader("Current Obstacles")
     for d in dirs:
-        v_h = st.session_state.vault[d]["h"]
-        v_d = st.session_state.vault[d]["dist"]
-        st.write(f"**{d}:** {int(v_h)}ft tree @ {int(v_d)}ft away")
+        if st.session_state.vault[d]:
+            st.write(f"**{d}:** {len(st.session_state.vault[d])} obstacles")
+            if st.button(f"🗑️ Clear {d}", key=f"clr_{d}"):
+                st.session_state.vault[d] = []
+                st.rerun()
 
-    if st.button("🚨 RESET ALL"):
-        st.session_state.vault = {d: {"dist": 150.0, "h": 60.0} for d in dirs}
+    if st.button("🚨 RESET ENTIRE SURVEY"):
+        st.session_state.vault = {d: [] for d in dirs}
         st.rerun()
 
 # --- 4. SATELLITE MAP ---
@@ -87,21 +86,38 @@ if out and out.get("last_clicked"):
         st.rerun()
     else:
         st.session_state.last_click_dist = nd
-        st.write(f"Detected: **{int(nd)} ft**. Enter MSL heights in sidebar and click 'Save'.")
+        st.write(f"Detected Distance: **{int(nd)} ft**. Enter MSL and click 'Add'.")
 
-# --- 5. RESULTS MAP ---
-st.subheader("Final Range & Jurisdiction")
+# --- 5. CALCULATION (WORST-CASE ANALYSIS) ---
+st.subheader("Final Range Analysis (Worst-Case Obstruction)")
 rf_pts = []
 max_ft = 3.5 * 5280
 bearings = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
 
 for d, ang in bearings.items():
-    h, dist, ant = st.session_state.vault[d]["h"], st.session_state.vault[d]["dist"], b_h + 15
-    cd = max_ft if h <= ant else ((d_alt - ant) * dist) / (h - ant)
-    fd = min(max(cd, dist), max_ft)
-    dest = geodesic(feet=fd).destination(st.session_state.center_coord, ang)
-    rf_pts.append({"lat": dest.latitude, "lon": dest.longitude, "name": d, "dist": fd})
+    direction_limits = [max_ft] # Default to 3.5 miles
+    
+    # Check every obstacle in this direction
+    for obs in st.session_state.vault[d]:
+        h, dist = obs["h"], obs["dist"]
+        
+        if h <= ant_total:
+            limit = max_ft
+        else:
+            # How far can we go before THIS specific obstacle blocks us?
+            limit = ((d_alt - ant_total) * dist) / (h - ant_total)
+            limit = max(limit, dist) # Can't fly through the tree
+            
+        direction_limits.append(limit)
+    
+    # THE DECIDING FACTOR: The shortest limit wins
+    final_d = min(direction_limits)
+    final_d = min(final_d, max_ft)
+    
+    dest = geodesic(feet=final_d).destination(st.session_state.center_coord, ang)
+    rf_pts.append({"lat": dest.latitude, "lon": dest.longitude, "name": d, "dist": final_d})
 
+# Results Map
 res_map = folium.Map(location=st.session_state.center_coord, zoom_start=13, control_scale=True)
 geo = get_city(st.session_state.center_coord[0], st.session_state.center_coord[1])
 if geo:
