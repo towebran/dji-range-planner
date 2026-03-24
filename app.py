@@ -1,48 +1,61 @@
 import streamlit as st
-import folium, requests, random, time
+import folium, requests, random, string
 from streamlit_folium import st_folium
 from geopy.distance import geodesic
 from folium.features import DivIcon
 
 st.set_page_config(layout="wide", page_title="DJI M4TD Pro Planner")
 
-# --- 1. SESSION STATE (The Vault) ---
+# --- 1. STATE INITIALIZATION ---
 dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 if 'vault' not in st.session_state:
     st.session_state.vault = {d: [] for d in dirs}
 if 'center_coord' not in st.session_state:
-    st.session_state.center_coord = [33.6644, -84.0113] # Conyers
+    st.session_state.center_coord = [33.6644, -84.0113]
 if 'last_click_dist' not in st.session_state:
     st.session_state.last_click_dist = 0.0
 if 'map_v' not in st.session_state:
     st.session_state.map_v = 1
 
-# --- 2. THE NEW "UNBLOCKABLE" SEARCH ---
+# --- 2. MULTI-SERVICE SEARCH (The Fix) ---
 def perform_search():
     query = st.session_state.search_box
-    if query:
-        # Use a random browser-like User Agent to prevent blocking
-        headers = {'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) DJI_Survey_{random.randint(1,999)}'}
-        url = f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=1"
-        try:
-            res = requests.get(url, headers=headers, timeout=10).json()
-            if res:
-                st.session_state.center_coord = [float(res[0]['lat']), float(res[0]['lon'])]
-                st.session_state.map_v += 1 # Forces map to snap to new location
-                st.toast(f"📍 Found: {res[0]['display_name'][:40]}...")
-            else:
-                st.error("Address not found. Try adding Zip or State.")
-        except Exception as e:
-            st.error("Search service busy. Please try again in 5 seconds.")
+    if not query: return
+    
+    # Try Service A: Nominatim (Standard)
+    ua = f"dji_survey_{''.join(random.choices(string.ascii_lowercase, k=5))}"
+    nom_url = f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=1"
+    
+    try:
+        res = requests.get(nom_url, headers={'User-Agent': ua}, timeout=5).json()
+        if res:
+            st.session_state.center_coord = [float(res[0]['lat']), float(res[0]['lon'])]
+            st.session_state.map_v += 1
+            st.toast("✅ Nominatim found it!")
+            return
+    except:
+        pass # If Nominatim is busy, immediately try Service B
+
+    # Try Service B: ArcGIS (Professional Failover)
+    arc_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={query}&maxLocations=1"
+    try:
+        res = requests.get(arc_url, timeout=5).json()
+        if res.get('candidates'):
+            loc = res['candidates'][0]['location']
+            st.session_state.center_coord = [loc['y'], loc['x']]
+            st.session_state.map_v += 1
+            st.toast("🚀 ArcGIS Failover found it!")
+            return
+    except:
+        st.error("Both search services are currently busy. Please wait 10 seconds and try again.")
 
 # --- 3. UI LAYOUT ---
 st.title("📡 DJI M4TD Multi-Obstacle Precision Planner")
 
 with st.sidebar:
     st.header("1. Find Location")
-    # Moved search here to prevent the map from "refresh-blocking" your typing
-    st.text_input("Enter Address:", key="search_box", on_change=perform_search, placeholder="123 Main St, Conyers, GA")
+    st.text_input("Enter Address:", key="search_box", on_change=perform_search)
     
     st.header("2. Site Specs")
     b_h = st.number_input("Building Height (ft)", value=20)
@@ -53,7 +66,7 @@ with st.sidebar:
     st.subheader("3. Add Obstacle")
     target_dir = st.selectbox("Direction:", dirs)
     
-    st.write(f"**Click Dist:** {int(st.session_state.last_click_dist)} ft")
+    st.write(f"**Dist:** {int(st.session_state.last_click_dist)} ft")
     g_msl = st.number_input("Ground MSL", value=900.0, step=1.0)
     t_msl = st.number_input("Top MSL", value=960.0, step=1.0)
     calc_h = t_msl - g_msl
@@ -61,7 +74,7 @@ with st.sidebar:
 
     if st.button(f"➕ Add to {target_dir}"):
         st.session_state.vault[target_dir].append({"dist": round(st.session_state.last_click_dist, 1), "h": calc_h})
-        st.success(f"Added to {target_dir}!")
+        st.success(f"Added!")
 
     st.divider()
     if st.button("🚨 RESET ALL"):
@@ -71,8 +84,7 @@ with st.sidebar:
         st.rerun()
 
 # --- 4. SATELLITE SURVEY MAP ---
-# The map version key forces the map to jump to the new search address
-m_key = f"sat_map_v{st.session_state.map_v}"
+m_key = f"sat_v{st.session_state.map_v}"
 m = folium.Map(location=st.session_state.center_coord, zoom_start=19, 
                tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
 folium.Marker(st.session_state.center_coord, icon=folium.Icon(color='red')).add_to(m)
@@ -83,13 +95,12 @@ if out and out.get("last_clicked"):
     nl, no = out["last_clicked"]["lat"], out["last_clicked"]["lng"]
     nd = geodesic(st.session_state.center_coord, (nl, no)).feet
     
-    if nd < 25: # Click dock to move center
+    if nd < 25:
         st.session_state.center_coord = [nl, no]
         st.session_state.map_v += 1
         st.rerun()
     else:
         st.session_state.last_click_dist = nd
-        st.write(f"Detected: **{int(nd)} ft**. Enter MSL in sidebar and click Add.")
 
 # --- 5. RESULTS ANALYSIS ---
 st.subheader("Final Range & Jurisdiction")
@@ -113,7 +124,7 @@ res_map = folium.Map(location=st.session_state.center_coord, zoom_start=13, cont
 # City Limits logic
 try:
     c_url = f"https://nominatim.openstreetmap.org/reverse?lat={st.session_state.center_coord[0]}&lon={st.session_state.center_coord[1]}&format=json&polygon_geojson=1&zoom=10"
-    c_res = requests.get(c_url, headers={'User-Agent': 'DJI_Survey_Tool'}).json()
+    c_res = requests.get(c_url, headers={'User-Agent': f'dji_city_{random.randint(1,999)}'}).json()
     if 'geojson' in c_res:
         folium.GeoJson(c_res['geojson'], style_function=lambda x: {'color':'red','fill':None,'dashArray':'5,5','weight':3}).add_to(res_map)
 except: pass
