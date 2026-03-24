@@ -6,115 +6,159 @@ from geopy.geocoders import Nominatim
 from folium.features import DivIcon
 from concurrent.futures import ThreadPoolExecutor
 
-# --- 1. CORE CONFIG ---
-FREQ_24 = 2.4
-TX_POWER = 33.0 
-REQD_SIGNAL = -85.0
-FRESNEL_60 = 0.60
+# --- 1. SETTINGS & RF DEFAULTS ---
+st.set_page_config(layout="wide", page_title="DJI M4TD Strategic Planner")
 
-st.set_page_config(layout="wide", page_title="DJI M4TD Jurisdiction Planner")
+# DJI O3 Enterprise / RC Plus 2 Calibration
+TX_POWER = 33.0
+REQD_SIGNAL = -88.0  # Conservative cutoff for HD video
+FREQ = 2.4
 
-# Initialize Session States
+# Initialize Persistent State
+if 'center' not in st.session_state: st.session_state.center = [33.6644, -84.0113]
 if 'vault' not in st.session_state: st.session_state.vault = []
 if 'manual_obs' not in st.session_state: st.session_state.manual_obs = []
-if 'center' not in st.session_state: st.session_state.center = [33.6644, -84.0113]
-if 'city_name' not in st.session_state: st.session_state.city_name = ""
+if 'city_info' not in st.session_state: st.session_state.city_info = {"name": "None", "poly": None}
 
-# --- 2. JURISDICTION & ELEVATION ENGINES ---
-def get_city_boundary(lat, lon):
-    """Finds city name and fetches GeoJSON boundary from OSM/Overpass."""
-    try:
-        geolocator = Nominatim(user_agent="m4td_planner")
-        location = geolocator.reverse(f"{lat}, {lon}", exactly_one=True)
-        address = location.raw.get('address', {})
-        city = address.get('city') or address.get('town') or address.get('village')
-        
-        # Fetch Boundary from OSM Nominatim (Simplified)
-        osm_id = location.raw.get('osm_id')
-        osm_type = location.raw.get('osm_type')
-        if city:
-            # Overpass query or direct geojson fetch
-            poly_url = f"https://nominatim.openstreetmap.org/details?osmtype={osm_type[0].upper()}&osmid={osm_id}&class=boundary&addressdetails=1&hierarchy=0&group_hierarchy=1&format=json&polygon_geojson=1"
-            res = requests.get(poly_url).json()
-            return city, res.get('geometry')
-    except: return None, None
-    return None, None
-
+# --- 2. THE ENGINE ROOM ---
 def get_elev_msl(lat, lon):
     url = f"https://epqs.nationalmap.gov/v1/json?x={lon}&y={lat}&units=Feet&output=json"
     try:
-        return float(requests.get(url, timeout=2).json().get('value', 900.0))
+        res = requests.get(url, timeout=2).json()
+        return float(res.get('value', 900.0))
     except: return 900.0
 
-# --- 3. RF PHYSICS ---
-def get_diffraction_loss(v):
-    if v <= -1: return 0
-    if -1 < v <= 0: return 20 * math.log10(0.5 - 0.62 * v)
-    return 20 * math.log10(0.5 * math.exp(-0.95 * v)) if v <= 1 else 20 * math.log10(0.225 / v)
+def get_jurisdiction(lat, lon):
+    """Fetches city name and boundary GeoJSON."""
+    try:
+        geolocator = Nominatim(user_agent="m4td_planner_v2")
+        location = geolocator.reverse(f"{lat}, {lon}", exactly_one=True, timeout=5)
+        addr = location.raw.get('address', {})
+        city = addr.get('city') or addr.get('town') or addr.get('village') or "Unknown"
+        
+        # Get boundary polygon from Nominatim
+        osm_id = location.raw.get('osm_id')
+        osm_type = location.raw.get('osm_type')[0].upper()
+        poly_url = f"https://nominatim.openstreetmap.org/details?osmtype={osm_type}&osmid={osm_id}&format=json&polygon_geojson=1"
+        poly_data = requests.get(poly_url, timeout=5).json()
+        return city, poly_data.get('geometry')
+    except: return "Area Found", None
 
-# --- 4. SIDEBAR & INPUTS ---
+def calculate_rssi(dist_ft, h_tx, h_rx, obs_msl):
+    """Knife-edge diffraction logic."""
+    dist_km = dist_ft / 3280.84
+    fspl = 20 * math.log10(max(0.01, dist_km)) + 20 * math.log10(FREQ) + 92.45
+    rssi_base = TX_POWER - fspl
+    
+    # Diffraction Parameter (v)
+    mid_dist_m = (dist_ft / 2) * 0.3048
+    wavelength = 0.125
+    beam_h = h_tx + (h_rx - h_tx) * 0.5
+    h_clearance = beam_h - obs_msl
+    
+    v = -h_clearance * math.sqrt(2 / (wavelength * mid_dist_m))
+    # Approximation of Lee's Model
+    loss = 0
+    if v > -0.7:
+        loss = 6.9 + 20 * math.log10(math.sqrt((v-0.1)**2 + 1) + v - 0.1)
+        
+    return rssi_base - loss
+
+# --- 3. UI ---
 with st.sidebar:
-    st.header("1. Site Details")
-    addr = st.text_input("Site Address", "Crooked Creek, GA")
+    st.header("1. Site Config")
+    addr_input = st.text_input("Address / Coordinates", "Crooked Creek, GA")
     ant_h = st.number_input("Antenna AGL (ft)", 35.0)
     drone_h = st.slider("Mission Alt (ft AGL)", 100, 400, 300)
-    clutter = st.slider("Global Tree Canopy (ft)", 0, 100, 60)
+    clutter = st.slider("Tree Canopy Buffer (ft)", 0, 100, 60)
     
-    st.header("2. Manual Obstacles")
-    obs_dist = st.number_input("Dist to Obstacle (ft)", 1500)
-    obs_agl = st.number_input("Obstacle Height AGL (ft)", 150.0)
-    obs_dir = st.selectbox("Direction", ["N", "NE", "E", "SE", "S", "SW", "W", "NW"])
+    st.header("2. Manual Obstructions")
+    m_dist = st.number_input("Dist (ft)", 2000)
+    m_h = st.number_input("Obstacle AGL (ft)", 150.0)
+    m_dir = st.selectbox("Direction", ["N", "NE", "E", "SE", "S", "SW", "W", "NW"])
     
-    if st.button("➕ Add Manual Obstacle"):
-        st.session_state.manual_obs.append({"dist": obs_dist, "agl": obs_agl, "dir": obs_dir})
+    if st.button("➕ Add Obstacle"):
+        st.session_state.manual_obs.append({"dist": m_dist, "agl": m_h, "dir": m_dir})
+        st.toast("Obstacle Added")
 
     if st.button("🚀 RUN FULL ASSESSMENT"):
-        with st.spinner("Fetching Boundaries & Terrain..."):
+        with st.spinner("Analyzing Site..."):
             # A. Geocode
-            g_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={addr}&maxLocations=1"
-            loc = requests.get(g_url).json()['candidates'][0]['location']
-            st.session_state.center = [loc['y'], loc['x']]
-            
-            # B. City Limits
-            st.session_state.city_name, st.session_state.city_poly = get_city_boundary(loc['y'], loc['x'])
-            
-            # C. Terrain Scan
-            dock_g = get_elev_msl(loc['y'], loc['x'])
-            h_tx = dock_g + ant_h + 15
-            h_rx = dock_g + drone_h
-            
-            # RF Scan logic (Simplified for speed)
-            new_vault = []
-            dirs = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
-            for name, ang in dirs.items():
-                # Check ground every 1.5 miles for speed
-                limit = 3.5 * 5280
-                new_vault.append({"brng": ang, "limit": limit, "name": name})
-            st.session_state.vault = new_vault
+            g_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={addr_input}&maxLocations=1"
+            res = requests.get(g_url).json()
+            if res.get('candidates'):
+                loc = res['candidates'][0]['location']
+                st.session_state.center = [loc['y'], loc['x']]
+                
+                # B. Jurisdiction
+                name, poly = get_jurisdiction(loc['y'], loc['x'])
+                st.session_state.city_info = {"name": name, "poly": poly}
+                
+                # C. RF Scan
+                dock_g = get_elev_msl(loc['y'], loc['x'])
+                h_tx = dock_g + ant_h + 15
+                h_rx = dock_g + drone_h
+                
+                new_vault = []
+                bearings = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
+                for b_name, ang in bearings.items():
+                    # Scan every 1,500ft
+                    limit = 18480
+                    for d in range(1500, 18501, 1500):
+                        pt = geodesic(feet=d).destination(st.session_state.center, ang)
+                        ground = get_elev_msl(pt.latitude, pt.longitude)
+                        obs_total = ground + clutter
+                        
+                        # Apply Manual Overrides
+                        for m_ob in st.session_state.manual_obs:
+                            if m_ob['dir'] == b_name and abs(m_ob['dist'] - d) < 750:
+                                obs_total = max(obs_total, ground + m_ob['agl'])
+                        
+                        rssi = calculate_rssi(d, h_tx, h_rx, obs_total)
+                        if rssi < REQD_SIGNAL:
+                            limit = d
+                            break
+                    new_vault.append({"brng": ang, "limit": limit, "name": b_name})
+                st.session_state.vault = new_vault
+                st.success("Scan Complete")
 
-# --- 5. MAP & CROSS-SECTION ---
-st.subheader(f"Jurisdiction: {st.session_state.city_name or 'Searching...'}")
+    if st.button("🚨 RESET"):
+        st.session_state.vault = []
+        st.session_state.manual_obs = []
+        st.rerun()
+
+# --- 4. THE MAP ---
+st.subheader(f"Jurisdiction: {st.session_state.city_info['name']}")
 
 m = folium.Map(location=st.session_state.center, zoom_start=13, tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
 
-# Draw City Limits
-if 'city_poly' in st.session_state and st.session_state.city_poly:
-    folium.GeoJson(st.session_state.city_poly, name="City Limits",
-                   style_function=lambda x: {'fillColor': 'yellow', 'color': 'yellow', 'weight': 2, 'fillOpacity': 0.1}).add_to(m)
+# City Limits
+if st.session_state.city_info['poly']:
+    folium.GeoJson(st.session_state.city_info['poly'], 
+                   style_function=lambda x: {'color': 'yellow', 'fillColor': 'yellow', 'fillOpacity': 0.1}).add_to(m)
 
-# Distance Labels & Rings
+# Rings & Labels
 for mi in [1, 2, 3]:
     folium.Circle(st.session_state.center, radius=mi*1609.34, color='white', weight=1, opacity=0.3).add_to(m)
-    lbl_pt = geodesic(miles=mi).destination(st.session_state.center, 45)
-    folium.Marker([lbl_pt.latitude, lbl_pt.longitude], icon=DivIcon(html=f'<div style="color:white; font-size:10px;">{mi}mi</div>')).add_to(m)
+    folium.Marker(geodesic(miles=mi).destination(st.session_state.center, 45),
+                  icon=DivIcon(html=f'<div style="color:white; font-size:10px;">{mi}mi</div>')).add_to(m)
 
-# Markers
-folium.Marker(st.session_state.center, tooltip="HOME", icon=folium.Icon(color='blue', icon='home')).add_to(m)
+# Home Marker
+folium.Marker(st.session_state.center, icon=folium.Icon(color='blue', icon='home')).add_to(m)
 
-# Manual Obstacles Visual
+# Safe Zone
+if st.session_state.vault:
+    poly_pts = []
+    for a in range(0, 361, 10):
+        closest = min(st.session_state.vault, key=lambda x: abs(x['brng'] - a))
+        p = geodesic(feet=closest['limit']).destination(st.session_state.center, a)
+        poly_pts.append([p.latitude, p.longitude])
+    folium.Polygon(poly_pts, color='#00FF00', fill=True, fill_opacity=0.2).add_to(m)
+
+# Manual Obstacles
 for o in st.session_state.manual_obs:
-    bearings = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
-    m_pt = geodesic(feet=o['dist']).destination(st.session_state.center, bearings[o['dir']])
-    folium.Marker([m_pt.latitude, m_pt.longitude], tooltip=f"MANUAL OBS: {o['agl']}ft", icon=folium.Icon(color='orange', icon='warning')).add_to(m)
+    ang = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}[o['dir']]
+    p = geodesic(feet=o['dist']).destination(st.session_state.center, ang)
+    folium.Marker([p.latitude, p.longitude], icon=folium.Icon(color='orange', icon='warning')).add_to(m)
 
 folium_static(m, width=1100, height=600)
