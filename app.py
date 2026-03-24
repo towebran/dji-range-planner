@@ -5,7 +5,7 @@ from streamlit_folium import st_folium
 from geopy.distance import geodesic
 from folium.features import DivIcon
 
-st.set_page_config(layout="wide", page_title="DJI M4TD Engineering Report")
+st.set_page_config(layout="wide", page_title="DFR Site Assessment")
 
 # --- 1. SESSION STATE ---
 dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
@@ -34,7 +34,7 @@ def perform_search():
     except: st.error("Search Service Busy. Try again in a moment.")
 
 # --- 3. UI TOP & INSTRUCTIONS ---
-st.title("🛰️ DJI M4TD Site Survey & Range Planner")
+st.title("🛰️ DFR Site Assessment")
 
 with st.expander("📖 HOW TO USE THIS TOOL (Click to Expand)", expanded=True):
     st.markdown("""
@@ -172,7 +172,7 @@ full_html = f"""
 </div>
 """
 st.download_button(
-    label="📩 Download Report for Client (HTML)",
+    label="📩 Download Report (HTML)",
     data=full_html,
     file_name=f"DJI_Report_{site_name.replace(' ', '_')}.html",
     mime="text/html"
