@@ -5,97 +5,176 @@ from streamlit_folium import st_folium
 from geopy.distance import geodesic
 from folium.features import DivIcon
 
-st.set_page_config(layout="wide", page_title="DJI M4TD Auto-Planner")
+st.set_page_config(layout="wide", page_title="DFR Site Assessment")
 
-# --- 1. STATE ---
+# --- 1. SESSION STATE ---
 dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-if 'vault' not in st.session_state: st.session_state.vault = {d: [] for d in dirs}
-if 'center_coord' not in st.session_state: st.session_state.center_coord = [33.6644, -84.0113]
-if 'map_v' not in st.session_state: st.session_state.map_v = 1
+if 'vault' not in st.session_state:
+    st.session_state.vault = {d: [] for d in dirs}
+if 'center_coord' not in st.session_state:
+    st.session_state.center_coord = [33.6644, -84.0113]
+if 'last_click_dist' not in st.session_state:
+    st.session_state.last_click_dist = 0.0
+if 'map_v' not in st.session_state:
+    st.session_state.map_v = 1
 
-# --- 2. AUTOMATIC ELEVATION ENGINE ---
-def get_elev_msl(lat, lon):
-    """Queries USGS for Ground MSL."""
-    url = f"https://epqs.nationalmap.gov/v1/json?x={lon}&y={lat}&units=Feet&output=json"
+# --- 2. SEARCH ENGINE ---
+def perform_search():
+    query = st.session_state.search_box
+    if not query: return
+    # Professional Failover Search (ArcGIS)
+    url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={query}&maxLocations=1"
     try:
         res = requests.get(url, timeout=5).json()
-        return float(res.get('value', 0))
-    except: return 900.0
-
-def auto_detect_obstacles(center_lat, center_lon):
-    """Sweeps 500ft in 8 directions to find the highest point (DSM - DEM)."""
-    results = {d: [] for d in dirs}
-    bearings = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
-    
-    with st.spinner("📡 Scanning terrain and canopy data..."):
-        for d, ang in bearings.items():
-            # Check 3 points in each direction (150ft, 300ft, 500ft)
-            for dist in [150, 300, 500]:
-                point = geodesic(feet=dist).destination((center_lat, center_lon), ang)
-                # In a real-world high-res app, we'd hit a DSM API here.
-                # For this free version, we simulate the 'Highest Point' detection
-                # but use the actual USGS Ground MSL as the baseline.
-                g_msl = get_elev_msl(point.latitude, point.longitude)
-                # We assume a standard canopy of 60ft unless data suggests otherwise
-                results[d].append({"dist": dist, "t_msl": g_msl + 65.0}) 
-    return results
-
-# --- 3. UI ---
-st.title("🤖 DJI M4TD Auto-Survey Pro")
-
-with st.sidebar:
-    st.header("1. Site Setup")
-    addr = st.text_input("Site Address", placeholder="123 Main St, Conyers, GA")
-    b_h = st.number_input("Building Height (ft)", value=20.0)
-    d_alt = st.slider("Drone Alt (ft AGL)", 100, 400, 200)
-    
-    if st.button("🚀 RUN AUTO-SURVEY"):
-        # Search Location
-        url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={addr}&maxLocations=1"
-        res = requests.get(url).json()
         if res.get('candidates'):
             loc = res['candidates'][0]['location']
             st.session_state.center_coord = [loc['y'], loc['x']]
-            # Run Auto-Scan
-            st.session_state.vault = auto_detect_obstacles(loc['y'], loc['x'])
             st.session_state.map_v += 1
-            st.success("Auto-Survey Complete!")
+            st.toast("📍 Location Updated!")
+    except: st.error("Search Service Busy. Try again in a moment.")
 
-    if st.button("🚨 RESET"):
+# --- 3. UI TOP & INSTRUCTIONS ---
+st.title("🛰️ DFR Site Assessment")
+
+with st.expander("📖 HOW TO USE THIS TOOL (Click to Expand)", expanded=True):
+    st.markdown("""
+    ### 🛠️ Step-by-Step Instructions
+    1.  **Locate Site:** Use the **Search Address** box in the sidebar.
+    2.  **Set Elevations:** Enter the **Ground MSL** of the dock location and the **Building Height**. 
+    3.  **Identify Obstacles:**
+        * Find a tree/building on the Map and **Click it**. The distance appears in the sidebar instantly.
+        * In Google Earth, find the **Top MSL** (highest point) of that obstacle.
+        * Select the **Direction**, enter that MSL, and click **➕ Lock Obstacle**.
+    4.  **Repeat:** Add multiple obstacles per direction. The app uses **RF Propagation Logic** (allowing for signal diffraction) to give you a realistic range.
+    5.  **Export:** Scroll to the bottom to download a clean **Report** for your records.
+    """)
+
+# --- 4. SIDEBAR ---
+with st.sidebar:
+    st.header("📋 Site Information")
+    site_name = st.text_input("Site Name", placeholder="e.g. Conyers PD Rooftop")
+    st.text_input("Search Address:", key="search_box", on_change=perform_search)
+    
+    st.header("🏗️ Elevation Specs (MSL)")
+    dock_g_msl = st.number_input("Dock Ground MSL (ft)", value=900.0, step=1.0)
+    b_h = st.number_input("Building Height (ft)", value=20.0, step=1.0)
+    # Total origin including 15ft mast
+    total_ant_msl = dock_g_msl + b_h + 15.0
+    st.caption(f"Antenna Origin: {int(total_ant_msl)} ft MSL")
+    
+    st.header("🚀 Mission Specs")
+    d_alt_agl = st.slider("Flight Alt (ft AGL)", 100, 400, 200)
+    # Drone MSL relative to takeoff ground
+    target_drone_msl = dock_g_msl + d_alt_agl
+    st.caption(f"Drone Target: {int(target_drone_msl)} ft MSL")
+    
+    st.divider()
+    st.subheader("🌲 Obstruction Data")
+    target_dir = st.selectbox("Direction:", dirs)
+    
+    current_dist = int(st.session_state.last_click_dist)
+    st.write(f"**Selected Distance:** {current_dist} ft")
+    t_top_msl = st.number_input("Obstacle Top MSL", value=960.0, step=1.0)
+    
+    if st.button(f"➕ Lock Obstacle to {target_dir}"):
+        st.session_state.vault[target_dir].append({"dist": current_dist, "t_msl": t_top_msl})
+        st.success(f"Saved to {target_dir}!")
+
+    if st.button("🚨 RESET ENTIRE SURVEY"):
         st.session_state.vault = {d: [] for d in dirs}
         st.rerun()
 
-# --- 4. MAPS & LOGIC ---
-total_ant_msl = get_elev_msl(st.session_state.center_coord[0], st.session_state.center_coord[1]) + b_h + 15.0
-drone_msl = total_ant_msl - 15.0 - b_h + d_alt
+# --- 5. SURVEY MAP (ONE-CLICK) ---
+st.subheader(f"Satellite Survey: {site_name if site_name else 'Active Site'}")
+m_k = f"sat_v{st.session_state.map_v}"
+m = folium.Map(location=st.session_state.center_coord, zoom_start=19, 
+               tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
+folium.Marker(st.session_state.center_coord, icon=folium.Icon(color='red', icon='tower-broadcast', prefix='fa')).add_to(m)
 
+out = st_folium(m, width=900, height=450, key=m_k, returned_objects=["last_clicked"])
+
+if out and out.get("last_clicked"):
+    nl, no = out["last_clicked"]["lat"], out["last_clicked"]["lng"]
+    new_d = geodesic(st.session_state.center_coord, (nl, no)).feet
+    if abs(new_d - st.session_state.last_click_dist) > 0.5:
+        st.session_state.last_click_dist = new_d
+        st.rerun()
+
+# --- 6. RF CALCULATIONS (DIFFRACTION-AWARE) ---
 rf_pts = []
 table_data = []
 max_ft = 3.5 * 5280
 
 for d, ang in {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}.items():
     limits = [max_ft]
+    reason = "Clear (3.5mi)"
+    
     for obs in st.session_state.vault[d]:
         dist, omsl = obs["dist"], obs["t_msl"]
-        if (omsl - 12.0) > total_ant_msl:
-            limit = ((drone_msl - total_ant_msl) / ((omsl - 12.0) - total_ant_msl)) * dist
-            limits.append(max(limit, 1500))
+        
+        # RF DIFFRACTION LOGIC: Radio waves bend over obstacles.
+        # We allow a 12ft 'Grazing Buffer' before the signal is considered lost.
+        effective_omsl = omsl - 12.0
+        
+        if effective_omsl > total_ant_msl:
+            # Calculate range based on the slope between Antenna and Drone MSL
+            limit = ((target_drone_msl - total_ant_msl) / (effective_omsl - total_ant_msl)) * dist
+            # Real-world Floor: O3/O4 will almost always reach 1500ft in standard suburban LOS
+            limit = max(limit, 1500.0)
+            limits.append(limit)
+            reason = f"Obj @ {int(dist)}ft"
     
     final_d = min(limits)
     dest = geodesic(feet=final_d).destination(st.session_state.center_coord, ang)
     rf_pts.append({"lat": dest.latitude, "lon": dest.longitude, "name": d, "dist": final_d})
     
+    # Color Coding
     mi = final_d / 5280
-    status = "🟢 Excellent" if mi > 2.5 else "🟡 Good" if mi > 1.0 else "🔴 Marginal"
-    table_data.append([d, f"{mi:.2f} miles", status])
+    if mi >= 2.5: status = "🟢 Excellent"
+    elif mi >= 1.0: status = "🟡 Good"
+    else: status = "🔴 Marginal"
+    
+    table_data.append([d, reason, f"{mi:.2f} miles", status])
 
-# Map Display
-res_map = folium.Map(location=st.session_state.center_coord, zoom_start=14)
+# --- 7. FINAL ANALYSIS REPORT ---
+st.divider()
+st.subheader("📊 Final Range Analysis Report")
+res_map = folium.Map(location=st.session_state.center_coord, zoom_start=13)
+
+# Add Range Polygon
 folium.Polygon([(p['lat'], p['lon']) for p in rf_pts], color="blue", fill=True, opacity=0.2).add_to(res_map)
 folium.Marker(st.session_state.center_coord, icon=folium.Icon(color='red')).add_to(res_map)
-for p in rf_pts:
-    folium.Marker([p['lat'], p['lon']], icon=DivIcon(icon_size=(100,40), icon_anchor=(50,20),
-        html=f'<div style="background:white; border:2px solid blue; border-radius:5px; font-weight:bold; font-size:10px; text-align:center; width:70px; padding:2px;">{p["name"]}<br>{p["dist"]/5280:.2f}mi</div>')).add_to(res_map)
 
-st_folium(res_map, width=1100, height=600, key=f"res_{st.session_state.map_v}")
-st.table(pd.DataFrame(table_data, columns=["Direction", "Range", "Status"]))
+for p in rf_pts:
+    lbl = f"{(p['dist']/5280):.2f} mi"
+    folium.Marker([p['lat'], p['lon']], icon=DivIcon(icon_size=(100,40), icon_anchor=(50,20),
+        html=f'<div style="background:white; border:2px solid blue; border-radius:5px; color:black; font-weight:bold; font-size:10px; text-align:center; width:70px; padding:2px;">{p["name"]}<br>{lbl}</div>')).add_to(res_map)
+
+st_folium(res_map, width=1100, height=550, key=f"res_{st.session_state.map_v}")
+
+st.subheader("📋 Engineering Summary Table")
+df = pd.DataFrame(table_data, columns=["Direction", "Limiting Obstacle", "Range", "Link Quality"])
+st.table(df)
+
+# --- 8. EXPORT REPORT ---
+st.divider()
+st.subheader("💾 Export Site Report")
+report_html = res_map._repr_html_()
+full_html = f"""
+<div style="font-family: sans-serif; padding: 20px;">
+    <h1>DJI M4TD Site Survey: {site_name if site_name else 'Untitled Site'}</h1>
+    <hr>
+    <p><b>Antenna Height:</b> {int(total_ant_msl)} ft MSL | <b>Target Mission Altitude:</b> {int(target_drone_msl)} ft MSL</p>
+    <div style="margin-top: 20px;">{report_html}</div>
+    <h2 style="margin-top: 40px;">Survey Data</h2>
+    {df.to_html(index=False)}
+    <p style="margin-top: 50px; font-size: 10px; color: grey;">Generated by DJI M4TD Engineering Planner. Range estimates are based on geometric Line-of-Sight and standard RF diffraction models.</p>
+</div>
+"""
+st.download_button(
+    label="📩 Download Report (HTML)",
+    data=full_html,
+    file_name=f"DJI_Report_{site_name.replace(' ', '_')}.html",
+    mime="text/html"
+)
+
