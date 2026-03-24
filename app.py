@@ -7,22 +7,22 @@ from folium.features import DivIcon
 
 st.set_page_config(layout="wide", page_title="DJI M4TD Pro Planner")
 
-# --- 1. STATE ---
+# --- 1. STATE INITIALIZATION ---
+dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 if 'center_coord' not in st.session_state:
     st.session_state.center_coord = [33.66, -84.01]
 if 'last_click_dist' not in st.session_state:
     st.session_state.last_click_dist = 0.0
 
-dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 for d in dirs:
-    if f"dist_{d}" not in st.session_state: st.session_state[f"dist_{d}"] = 150.0
-    if f"h_{d}" not in st.session_state: st.session_state[f"h_{d}"] = 60.0
+    if f"val_dist_{d}" not in st.session_state: st.session_state[f"val_dist_{d}"] = 150.0
+    if f"val_h_{d}" not in st.session_state: st.session_state[f"val_h_{d}"] = 60.0
 
-# --- 2. LOGIC ---
+# --- 2. FUNCTIONS ---
 def search():
     if st.session_state.addr_input:
         try:
-            loc = Nominatim(user_agent="dji_pro").geocode(st.session_state.addr_input)
+            loc = Nominatim(user_agent="dji_pro_final").geocode(st.session_state.addr_input)
             if loc: st.session_state.center_coord = [loc.latitude, loc.longitude]
         except: st.error("Search error.")
 
@@ -33,7 +33,7 @@ def get_city(lat, lon):
         return res.get('geojson'), res.get('address', {}).get('city', 'City')
     except: return None, None
 
-# --- 3. UI ---
+# --- 3. UI & SEARCH ---
 st.title("📡 DJI Dock 3 / M4TD Pro Site Planner")
 st.text_input("Search Address", key="addr_input", on_change=search)
 
@@ -41,15 +41,23 @@ with st.sidebar:
     st.header("Site Specs")
     b_h = st.number_input("Bldg Height (ft)", value=20)
     d_alt = st.slider("Drone Alt (ft AGL)", 100, 400, 200)
+    st.divider()
     target_dir = st.selectbox("Assign Click to:", dirs)
     if st.button(f"📌 Save Click to {target_dir}"):
-        st.session_state[f"dist_{target_dir}"] = round(st.session_state.last_click_dist, 1)
+        st.session_state[f"val_dist_{target_dir}"] = round(st.session_state.last_click_dist, 1)
         st.rerun()
     st.divider()
     for d in dirs:
+        st.write(f"**Direction {d}**")
         cols = st.columns(2)
-        cols[0].number_input(f"{d} H", value=60.0, key=f"h_{d}")
-        cols[1].number_input(f"{d} Dist", key=f"dist_{d}")
+        st.session_state[f"val_h_{d}"] = cols[0].number_input(f"H", value=st.session_state[f"val_h_{d}"], key=f"input_h_{d}")
+        st.session_state[f"val_dist_{d}"] = cols[1].number_input(f"Dist", value=st.session_state[f"val_dist_{d}"], key=f"input_dist_{d}")
+    st.divider()
+    if st.button("🗑️ Clear All"):
+        for d in dirs:
+            st.session_state[f"val_dist_{d}"] = 150.0
+            st.session_state[f"val_h_{d}"] = 60.0
+        st.rerun()
 
 # --- 4. SATELLITE MAP ---
 m_key = f"m_{st.session_state.center_coord[0]}"
@@ -65,7 +73,7 @@ if out and out.get("last_clicked"):
         st.rerun()
     else:
         st.session_state.last_click_dist = nd
-        st.write(f"Detected: {int(nd)} ft. Hit 'Save' in sidebar.")
+        st.write(f"Detected: **{int(nd)} ft**. Hit 'Save' in sidebar.")
 
 # --- 5. RESULTS MAP ---
 st.subheader("Final Range & Jurisdiction")
@@ -74,7 +82,7 @@ max_ft = 3.5 * 5280
 bearings = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
 
 for d, ang in bearings.items():
-    h, dist, ant = st.session_state[f"h_{d}"], st.session_state[f"dist_{d}"], b_h + 15
+    h, dist, ant = st.session_state[f"val_h_{d}"], st.session_state[f"val_dist_{d}"], b_h + 15
     cd = max_ft if h <= ant else ((d_alt - ant) * dist) / (h - ant)
     fd = min(max(cd, dist), max_ft)
     dest = geodesic(feet=fd).destination(st.session_state.center_coord, ang)
@@ -83,14 +91,37 @@ for d, ang in bearings.items():
 res_map = folium.Map(location=st.session_state.center_coord, zoom_start=13, control_scale=True)
 geo, cname = get_city(st.session_state.center_coord[0], st.session_state.center_coord[1])
 if geo:
-    folium.GeoJson(geo, name="Limits", style_function=lambda x: {'color':'red','fill':None,'dashArray':'5,5','weight':3}).add_to(res_map)
+    folium.GeoJson(geo, style_function=lambda x: {'color':'red','fill':None,'dashArray':'5,5','weight':3}).add_to(res_map)
 
-folium.Polygon([(p['lat'], p['lon']) for p in rf_pts], color="blue", weight=2, fill=True, fill_opacity=0.2).add_to(res_map)
+folium.Polygon([(p['lat'], p['lon']) for p in rf_pts], color="blue", fill=True, opacity=0.2).add_to(res_map)
 folium.Marker(st.session_state.center_coord, icon=folium.Icon(color='red')).add_to(res_map)
 
 for p in rf_pts:
     mi = p['dist'] / 5280
     lbl = f"{mi:.2f} mi" if mi > 0.1 else f"{int(p['dist'])} ft"
-    folium.Marker([p['lat'], p['lon']], icon=DivIcon(icon_size=(100,20), html=f'<div style="font-size: 8pt; background: white; border: 1px solid blue; text-align: center; border-radius: 3px; font-weight: bold;">{p["name"]}<br>{lbl}</div>')).add_to(res_map)
+    # FIXED HTML FOR LABELS
+    folium.Marker(
+        [p['lat'], p['lon']],
+        icon=DivIcon(
+            icon_size=(100, 40),
+            icon_anchor=(50, 20),
+            html=f"""
+            <div style="
+                background-color: white; 
+                border: 2px solid blue; 
+                border-radius: 5px; 
+                color: black; 
+                font-weight: bold; 
+                font-size: 10px; 
+                text-align: center; 
+                line-height: 1.2;
+                padding: 2px;
+                width: 70px;
+                ">
+                {p['name']}<br>{lbl}
+            </div>
+            """
+        )
+    ).add_to(res_map)
 
 st_folium(res_map, width=1100, height=600, key="range_final")
