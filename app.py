@@ -1,109 +1,98 @@
 import streamlit as st
-import folium, requests, random, string
+import folium, requests, random, time
 from streamlit_folium import st_folium
 from geopy.distance import geodesic
-from geopy.geocoders import Nominatim
 from folium.features import DivIcon
 
 st.set_page_config(layout="wide", page_title="DJI M4TD Pro Planner")
 
-# --- 1. STATE INITIALIZATION ---
+# --- 1. SESSION STATE (The Vault) ---
 dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 if 'vault' not in st.session_state:
     st.session_state.vault = {d: [] for d in dirs}
 if 'center_coord' not in st.session_state:
-    st.session_state.center_coord = [33.66, -84.01]
+    st.session_state.center_coord = [33.6644, -84.0113] # Conyers
 if 'last_click_dist' not in st.session_state:
     st.session_state.last_click_dist = 0.0
-if 'map_version' not in st.session_state:
-    st.session_state.map_version = 0
+if 'map_v' not in st.session_state:
+    st.session_state.map_v = 1
 
-# --- 2. SEARCH FUNCTION (ONE-SHOT) ---
-def handle_search():
-    query = st.session_state.addr_input
+# --- 2. THE NEW "UNBLOCKABLE" SEARCH ---
+def perform_search():
+    query = st.session_state.search_box
     if query:
+        # Use a random browser-like User Agent to prevent blocking
+        headers = {'User-Agent': f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) DJI_Survey_{random.randint(1,999)}'}
+        url = f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit=1"
         try:
-            # Create a truly unique user agent
-            uid = ''.join(random.choices(string.ascii_letters, k=8))
-            geolocator = Nominatim(user_agent=f"dji_survey_{uid}", timeout=10)
-            location = geolocator.geocode(query)
-            
-            if location:
-                # Update State
-                st.session_state.center_coord = [location.latitude, location.longitude]
-                st.session_state.map_version += 1
-                # Clear the input box so it doesn't loop
-                st.session_state.addr_input = "" 
-                st.toast(f"Success! Fly to {location.address[:30]}...")
+            res = requests.get(url, headers=headers, timeout=10).json()
+            if res:
+                st.session_state.center_coord = [float(res[0]['lat']), float(res[0]['lon'])]
+                st.session_state.map_v += 1 # Forces map to snap to new location
+                st.toast(f"📍 Found: {res[0]['display_name'][:40]}...")
             else:
-                st.error(f"Could not find address: '{query}'. Try adding a zip code.")
+                st.error("Address not found. Try adding Zip or State.")
         except Exception as e:
-            st.error(f"Search Error: {str(e)}")
+            st.error("Search service busy. Please try again in 5 seconds.")
 
 # --- 3. UI LAYOUT ---
 st.title("📡 DJI M4TD Multi-Obstacle Precision Planner")
 
-# The 'on_change' combined with clearing the state prevents the "flicker-back"
-st.text_input("Search Address (Press Enter to Fly)", key="addr_input", on_change=handle_search)
-
 with st.sidebar:
-    st.header("Site Specs")
+    st.header("1. Find Location")
+    # Moved search here to prevent the map from "refresh-blocking" your typing
+    st.text_input("Enter Address:", key="search_box", on_change=perform_search, placeholder="123 Main St, Conyers, GA")
+    
+    st.header("2. Site Specs")
     b_h = st.number_input("Building Height (ft)", value=20)
     d_alt = st.slider("Drone Alt (ft AGL)", 100, 400, 200)
     ant_total = b_h + 15
     
     st.divider()
-    st.subheader("Add Obstruction")
+    st.subheader("3. Add Obstacle")
     target_dir = st.selectbox("Direction:", dirs)
     
-    st.write(f"**Distance:** {int(st.session_state.last_click_dist)} ft")
+    st.write(f"**Click Dist:** {int(st.session_state.last_click_dist)} ft")
     g_msl = st.number_input("Ground MSL", value=900.0, step=1.0)
     t_msl = st.number_input("Top MSL", value=960.0, step=1.0)
     calc_h = t_msl - g_msl
     st.info(f"Tree Height: {int(calc_h)} ft")
 
-    if st.button(f"➕ Add Obstacle to {target_dir}"):
-        new_obs = {"dist": round(st.session_state.last_click_dist, 1), "h": calc_h}
-        st.session_state.vault[target_dir].append(new_obs)
+    if st.button(f"➕ Add to {target_dir}"):
+        st.session_state.vault[target_dir].append({"dist": round(st.session_state.last_click_dist, 1), "h": calc_h})
         st.success(f"Added to {target_dir}!")
 
     st.divider()
-    for d in dirs:
-        if st.session_state.vault[d]:
-            if st.button(f"🗑️ Clear {d} ({len(st.session_state.vault[d])})", key=f"clr_{d}"):
-                st.session_state.vault[d] = []
-                st.rerun()
-
     if st.button("🚨 RESET ALL"):
         st.session_state.vault = {d: [] for d in dirs}
-        st.session_state.center_coord = [33.66, -84.01]
-        st.session_state.map_version += 1
+        st.session_state.center_coord = [33.6644, -84.0113]
+        st.session_state.map_v += 1
         st.rerun()
 
-# --- 4. INTERACTIVE SATELLITE MAP ---
-# Map key uses versioning to force a "Hard Refresh" on move
-m_k = f"sat_map_v{st.session_state.map_version}"
+# --- 4. SATELLITE SURVEY MAP ---
+# The map version key forces the map to jump to the new search address
+m_key = f"sat_map_v{st.session_state.map_v}"
 m = folium.Map(location=st.session_state.center_coord, zoom_start=19, 
                tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
 folium.Marker(st.session_state.center_coord, icon=folium.Icon(color='red')).add_to(m)
 
-out = st_folium(m, width=900, height=500, key=m_k)
+out = st_folium(m, width=900, height=500, key=m_key)
 
 if out and out.get("last_clicked"):
     nl, no = out["last_clicked"]["lat"], out["last_clicked"]["lng"]
     nd = geodesic(st.session_state.center_coord, (nl, no)).feet
     
-    if nd < 25:
+    if nd < 25: # Click dock to move center
         st.session_state.center_coord = [nl, no]
-        st.session_state.map_version += 1
+        st.session_state.map_v += 1
         st.rerun()
     else:
         st.session_state.last_click_dist = nd
-        st.write(f"Detected: **{int(nd)} ft**")
+        st.write(f"Detected: **{int(nd)} ft**. Enter MSL in sidebar and click Add.")
 
-# --- 5. RESULTS ---
-st.subheader("Final Range Analysis")
+# --- 5. RESULTS ANALYSIS ---
+st.subheader("Final Range & Jurisdiction")
 rf_pts = []
 max_ft = 3.5 * 5280
 bearings = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
@@ -121,12 +110,12 @@ for d, ang in bearings.items():
 
 res_map = folium.Map(location=st.session_state.center_coord, zoom_start=13, control_scale=True)
 
-# City Limits reverse geocode logic
+# City Limits logic
 try:
-    city_url = f"https://nominatim.openstreetmap.org/reverse?lat={st.session_state.center_coord[0]}&lon={st.session_state.center_coord[1]}&format=json&polygon_geojson=1&zoom=10"
-    city_res = requests.get(city_url, headers={'User-Agent': f'dji_city_{random.randint(1,999)}'}).json()
-    if 'geojson' in city_res:
-        folium.GeoJson(city_res['geojson'], style_function=lambda x: {'color':'red','fill':None,'dashArray':'5,5','weight':3}).add_to(res_map)
+    c_url = f"https://nominatim.openstreetmap.org/reverse?lat={st.session_state.center_coord[0]}&lon={st.session_state.center_coord[1]}&format=json&polygon_geojson=1&zoom=10"
+    c_res = requests.get(c_url, headers={'User-Agent': 'DJI_Survey_Tool'}).json()
+    if 'geojson' in c_res:
+        folium.GeoJson(c_res['geojson'], style_function=lambda x: {'color':'red','fill':None,'dashArray':'5,5','weight':3}).add_to(res_map)
 except: pass
 
 folium.Polygon([(p['lat'], p['lon']) for p in rf_pts], color="blue", fill=True, opacity=0.2).add_to(res_map)
@@ -138,4 +127,4 @@ for p in rf_pts:
     folium.Marker([p['lat'], p['lon']], icon=DivIcon(icon_size=(100,40), icon_anchor=(50,20),
         html=f'<div style="background: white; border: 2px solid blue; border-radius: 5px; color: black; font-weight: bold; font-size: 10px; text-align: center; width: 70px; padding: 2px;">{p["name"]}<br>{lbl}</div>')).add_to(res_map)
 
-st_folium(res_map, width=1100, height=600, key=f"res_v{st.session_state.map_version}")
+st_folium(res_map, width=1100, height=600, key=f"res_v{st.session_state.map_v}")
