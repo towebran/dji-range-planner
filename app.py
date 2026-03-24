@@ -3,141 +3,101 @@ import folium, requests, math, pandas as pd
 from streamlit_folium import folium_static
 from geopy.distance import geodesic
 from folium.features import DivIcon
+from concurrent.futures import ThreadPoolExecutor
 
-# --- 1. CONFIG & RF CONSTANTS ---
-# Calibrated for DJI O3 Enterprise (M4TD / RC Plus 2)
-FREQ_GHZ = 2.4 
-TX_POWER_DBM = 33.0     # DJI Max EIRP (FCC)
-RX_SENSITIVITY = -95.0  # Threshold for HD Video link
-FADE_MARGIN = 10.0      # Required buffer for interference
-REQD_SIGNAL = RX_SENSITIVITY + FADE_MARGIN # -85 dBm target
-EARTH_RADIUS_KM = 6371 * (4/3) # 4/3 Earth Radius for Refraction
+# --- 1. RF PHYSICS ENGINE (Knife-Edge Diffraction) ---
+def get_diffraction_loss(v):
+    """Lee's Piecewise Diffraction Model for Knife-Edge Obstacles."""
+    if v <= -1: return 0
+    if -1 < v <= 0: return 20 * math.log10(0.5 - 0.62 * v)
+    if 0 < v <= 1: return 20 * math.log10(0.5 * math.exp(-0.95 * v))
+    if 1 < v <= 2.4: return 20 * math.log10(0.4 - math.sqrt(0.1184 - (0.38 - 0.1 * v)**2))
+    return 20 * math.log10(0.225 / v)
 
-# --- 2. CORE RF PHYSICS ENGINE ---
-def get_elev_msl(lat, lon):
-    url = f"https://epqs.nationalmap.gov/v1/json?x={lon}&y={lat}&units=Feet&output=json"
-    try:
-        res = requests.get(url, timeout=2).json()
-        return float(res.get('value', 900.0))
-    except: return 900.0
-
-def calculate_link(dist_ft, h_tx_msl, h_rx_msl, obs_msl):
-    """Calculates Path Loss, Fresnel, and Earth Curvature."""
+def calculate_rf_health(dist_ft, h_tx, h_rx, obs_msl):
+    """Calculates Path Loss + Diffraction + Earth Curvature."""
     dist_km = dist_ft / 3280.84
-    if dist_km == 0: return 0, True
+    f_ghz = 2.4 # Standard DJI Control/Video Frequency
     
     # 1. Free Space Path Loss (FSPL)
-    fspl = 20 * math.log10(dist_km) + 20 * math.log10(FREQ_GHZ) + 92.45
-    rssi = TX_POWER_DBM - fspl
+    fspl = 20 * math.log10(max(0.01, dist_km)) + 20 * math.log10(f_ghz) + 92.45
+    rssi_base = 33.0 - fspl # 33dBm is DJI FCC Max Power
     
-    # 2. Earth Curvature Drop (ft)
-    # drop = (dist_miles^2) / 1.5 (with 4/3 refraction)
-    dist_mi = dist_ft / 5280
-    curv_drop = (dist_mi**2) / 1.5
+    # 2. Fresnel & Diffraction Parameter (v)
+    # v = h * sqrt( (2/lambda) * (1/d1 + 1/d2) )
+    mid_dist_km = dist_km / 2
+    wavelength = 0.125 # 2.4GHz in meters
+    fresnel_r = 17.32 * math.sqrt((mid_dist_km**2)/(f_ghz * dist_km))
     
-    # 3. Fresnel Zone Radius (60% clearance)
-    # r = 17.32 * sqrt( (d1 * d2) / (f * D) ) in meters
-    d1 = dist_km / 2
-    fresnel_r_m = 17.32 * math.sqrt((d1 * d1) / (FREQ_GHZ * dist_km))
-    fresnel_60_ft = (fresnel_r_m * 3.28084) * 0.60
+    # Clearance Height (h)
+    beam_h = h_tx + (h_rx - h_tx) * 0.5
+    h_clearance = beam_h - obs_msl
+    v = -h_clearance * math.sqrt(2 / (wavelength * (mid_dist_km * 1000)))
     
-    # 4. Line of Sight Math
-    # The signal beam height at this point (Linear slope)
-    beam_msl = h_tx_msl + (h_rx_msl - h_tx_msl) * 0.5 # Midpoint for worst Fresnel
-    effective_obs = obs_msl + fresnel_60_ft + curv_drop
+    diff_loss = abs(get_diffraction_loss(v))
+    final_rssi = rssi_base - diff_loss
     
-    is_los = beam_msl > effective_obs
-    return rssi, is_los
+    # Status Logic
+    if final_rssi > -80: return "Solid", "#00FF00" # Green
+    if final_rssi > -92: return "Degraded", "#FFA500" # Orange
+    return "Lost", "#FF0000" # Red
 
-# --- 3. UI LAYOUT ---
-st.set_page_config(layout="wide", page_title="M4TD Site Planner")
-st.title("🛡️ DJI M4TD Strategic RF & LOS Planner")
+# --- 2. DATA FETCHING (Parallel) ---
+@st.cache_data(ttl=3600)
+def get_elev_bulk(coords):
+    def fetch(p):
+        try:
+            url = f"https://epqs.nationalmap.gov/v1/json?x={p[1]}&y={p[0]}&units=Feet&output=json"
+            return float(requests.get(url, timeout=2).json().get('value', 900))
+        except: return 900.0
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        return list(ex.map(fetch, coords))
+
+# --- 3. APP UI ---
+st.set_page_config(layout="wide")
+st.title("🛡️ DJI M4TD Strategic RF Survey")
 
 with st.sidebar:
-    st.header("1. Site Inputs")
-    addr = st.text_input("Dock Address / Lat,Lon", "Crooked Creek, GA")
-    ant_agl = st.number_input("Antenna Height AGL (ft)", value=35.0)
-    drone_alt = st.selectbox("Drone Mission Alt (ft AGL)", [200, 300, 400])
+    addr = st.text_input("Site Address", "Crooked Creek, GA")
+    ant_h = st.number_input("Dock Antenna AGL (ft)", 35.0)
+    drone_h = st.slider("Mission Alt (ft AGL)", 100, 400, 300)
+    clutter = st.slider("Tree Canopy (ft)", 0, 100, 60)
     
-    st.header("2. Clutter/Obstacles")
-    global_clutter = st.slider("Global Tree/Bldg Height (ft)", 0, 100, 50)
-    
-    st.subheader("Manual Overrides")
-    ov_dir = st.selectbox("Direction", ["N", "E", "S", "W"])
-    ov_dist = st.number_input("Dist to Obstacle (ft)", value=2500)
-    ov_h = st.number_input("Obstacle Height MSL", value=1050.0)
+    run = st.button("🚀 RUN STRATEGIC SCAN")
 
-# --- 4. PROCESSING ---
+# --- 4. SCAN & MAP ---
 if 'center' not in st.session_state: st.session_state.center = [33.66, -84.01]
-if 'results' not in st.session_state: st.session_state.results = []
+if run:
+    g_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={addr}&maxLocations=1"
+    loc = requests.get(g_url).json()['candidates'][0]['location']
+    st.session_state.center = [loc['y'], loc['x']]
+    
+    dock_g = get_elev_bulk([st.session_state.center])[0]
+    h_tx = dock_g + ant_h + 15 # 15ft mast
+    h_rx = dock_g + drone_h
+    
+    bearings = {"N":0, "E":90, "S":180, "W":270, "NE":45, "SE":135, "SW":225, "NW":315}
+    results = []
+    
+    m = folium.Map(location=st.session_state.center, zoom_start=13, tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
+    
+    # Label Home Point
+    folium.Marker(st.session_state.center, popup="DOCK ORIGIN", icon=folium.Icon(color='blue', icon='home')).add_to(m)
 
-if st.button("🚀 Run Cardinal LOS Scan"):
-    with st.spinner("Sampling Terrain & Modeling Fresnel Zones..."):
-        # Geocode
-        g_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={addr}&maxLocations=1"
-        loc = requests.get(g_url).json()['candidates'][0]['location']
-        clat, clon = loc['y'], loc['x']
-        st.session_state.center = [clat, clon]
-        
-        dock_g = get_elev_msl(clat, clon)
-        h_tx_msl = dock_g + ant_agl
-        h_rx_msl = dock_g + drone_alt
-        
-        final_table = []
-        # Scan Cardinal Directions
-        bearings = {"N": 0, "NE": 45, "E": 90, "SE": 135, "S": 180, "SW": 225, "W": 270, "NW": 315}
-        
-        for name, ang in bearings.items():
-            max_r = 0
-            limit_reason = "Max Range"
-            limit_coord = [0,0]
+    for name, ang in bearings.items():
+        line_pts = [st.session_state.center]
+        for d_ft in range(2500, 19000, 2500): # Label points every ~0.5 mi
+            pt = geodesic(feet=d_ft).destination(st.session_state.center, ang)
+            ground = get_elev_bulk([(pt.latitude, pt.longitude)])[0]
+            status, color = calculate_rf_health(d_ft, h_tx, h_rx, ground + clutter)
             
-            # Sample every 250ft out to 6 miles
-            for d_ft in range(250, 31680, 250):
-                pt = geodesic(feet=d_ft).destination((clat, clon), ang)
-                ground = get_elev_msl(pt.latitude, pt.longitude)
-                
-                # Apply Clutter
-                obs_msl = ground + global_clutter
-                
-                # Apply Manual Overrides for this direction
-                if name == ov_dir and abs(d_ft - ov_dist) < 500:
-                    obs_msl = max(obs_msl, ov_h)
-                
-                rssi, los = calculate_link(d_ft, h_tx_msl, h_rx_msl, obs_msl)
-                
-                if not los:
-                    limit_reason = "LOS/Fresnel Block"
-                    limit_coord = [pt.latitude, pt.longitude]
-                    break
-                if rssi < REQD_SIGNAL:
-                    limit_reason = "Signal Decay"
-                    limit_coord = [pt.latitude, pt.longitude]
-                    break
-                max_r = d_ft
+            line_pts.append([pt.latitude, pt.longitude])
+            folium.PolyLine(line_pts, color=color, weight=4, opacity=0.8).add_to(m)
+            line_pts = [[pt.latitude, pt.longitude]] # Reset for next segment
             
-            final_table.append({
-                "Direction": name, 
-                "Max Range (mi)": round(max_r/5280, 2),
-                "Limit Reason": limit_reason,
-                "Coord": limit_coord
-            })
-        st.session_state.results = final_table
+            # Distance Markers
+            if ang in [0, 90, 180, 270]: # Only label cardinals to keep map clean
+                folium.Marker([pt.latitude, pt.longitude], icon=DivIcon(icon_size=(40,20),
+                    html=f'<div style="font-size: 8pt; color: white; background: black; padding: 2px;">{round(d_ft/5280,1)}mi</div>')).add_to(m)
 
-# --- 5. VISUALIZATION ---
-m = folium.Map(location=st.session_state.center, zoom_start=13, tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
-
-if st.session_state.results:
-    poly_pts = []
-    for row in st.session_state.results:
-        ang = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}[row['Direction']]
-        p = geodesic(miles=row['Max Range (mi)']).destination(st.session_state.center, ang)
-        poly_pts.append([p.latitude, p.longitude])
-        # Add Limit Markers
-        if row['Limit Reason'] != "Max Range":
-            folium.CircleMarker(row['Coord'], radius=5, color='red', fill=True, popup=row['Direction']).add_to(m)
-
-    folium.Polygon(poly_pts, color='cyan', weight=3, fill=True, fill_opacity=0.2).add_to(m)
-    st.table(pd.DataFrame(st.session_state.results))
-
-folium_static(m, width=1100, height=600)
+    folium_static(m, width=1100, height=650)
