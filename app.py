@@ -19,29 +19,33 @@ if 'last_click_dist' not in st.session_state:
 if 'map_version' not in st.session_state:
     st.session_state.map_version = 0
 
-# --- 2. SEARCH FUNCTION (REPAIRED) ---
-def search():
-    if st.session_state.addr_input:
+# --- 2. SEARCH FUNCTION (ONE-SHOT) ---
+def handle_search():
+    query = st.session_state.addr_input
+    if query:
         try:
-            # Create a completely unique random user agent to avoid being blocked
-            random_id = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
-            ua = f"dji_survey_tool_{random_id}"
-            
-            geolocator = Nominatim(user_agent=ua, timeout=10)
-            location = geolocator.geocode(st.session_state.addr_input)
+            # Create a truly unique user agent
+            uid = ''.join(random.choices(string.ascii_letters, k=8))
+            geolocator = Nominatim(user_agent=f"dji_survey_{uid}", timeout=10)
+            location = geolocator.geocode(query)
             
             if location:
+                # Update State
                 st.session_state.center_coord = [location.latitude, location.longitude]
                 st.session_state.map_version += 1
-                st.toast(f"Found: {location.address[:50]}...")
+                # Clear the input box so it doesn't loop
+                st.session_state.addr_input = "" 
+                st.toast(f"Success! Fly to {location.address[:30]}...")
             else:
-                st.error("Address not found. Try adding city and state.")
+                st.error(f"Could not find address: '{query}'. Try adding a zip code.")
         except Exception as e:
-            st.error(f"Search Service Busy. Try again in 5 seconds.")
+            st.error(f"Search Error: {str(e)}")
 
 # --- 3. UI LAYOUT ---
 st.title("📡 DJI M4TD Multi-Obstacle Precision Planner")
-st.text_input("Search Address", key="addr_input", on_change=search)
+
+# The 'on_change' combined with clearing the state prevents the "flicker-back"
+st.text_input("Search Address (Press Enter to Fly)", key="addr_input", on_change=handle_search)
 
 with st.sidebar:
     st.header("Site Specs")
@@ -54,8 +58,8 @@ with st.sidebar:
     target_dir = st.selectbox("Direction:", dirs)
     
     st.write(f"**Distance:** {int(st.session_state.last_click_dist)} ft")
-    g_msl = st.number_input("Ground MSL", value=900.0)
-    t_msl = st.number_input("Top MSL", value=960.0)
+    g_msl = st.number_input("Ground MSL", value=900.0, step=1.0)
+    t_msl = st.number_input("Top MSL", value=960.0, step=1.0)
     calc_h = t_msl - g_msl
     st.info(f"Tree Height: {int(calc_h)} ft")
 
@@ -77,8 +81,9 @@ with st.sidebar:
         st.session_state.map_version += 1
         st.rerun()
 
-# --- 4. SATELLITE MAP ---
-m_k = f"sat_v{st.session_state.map_version}"
+# --- 4. INTERACTIVE SATELLITE MAP ---
+# Map key uses versioning to force a "Hard Refresh" on move
+m_k = f"sat_map_v{st.session_state.map_version}"
 m = folium.Map(location=st.session_state.center_coord, zoom_start=19, 
                tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
 folium.Marker(st.session_state.center_coord, icon=folium.Icon(color='red')).add_to(m)
@@ -116,11 +121,10 @@ for d, ang in bearings.items():
 
 res_map = folium.Map(location=st.session_state.center_coord, zoom_start=13, control_scale=True)
 
-# City Limits reverse geocode
+# City Limits reverse geocode logic
 try:
-    ua_city = f"dji_city_check_{random.randint(1000,9999)}"
     city_url = f"https://nominatim.openstreetmap.org/reverse?lat={st.session_state.center_coord[0]}&lon={st.session_state.center_coord[1]}&format=json&polygon_geojson=1&zoom=10"
-    city_res = requests.get(city_url, headers={'User-Agent': ua_city}).json()
+    city_res = requests.get(city_url, headers={'User-Agent': f'dji_city_{random.randint(1,999)}'}).json()
     if 'geojson' in city_res:
         folium.GeoJson(city_res['geojson'], style_function=lambda x: {'color':'red','fill':None,'dashArray':'5,5','weight':3}).add_to(res_map)
 except: pass
@@ -134,4 +138,4 @@ for p in rf_pts:
     folium.Marker([p['lat'], p['lon']], icon=DivIcon(icon_size=(100,40), icon_anchor=(50,20),
         html=f'<div style="background: white; border: 2px solid blue; border-radius: 5px; color: black; font-weight: bold; font-size: 10px; text-align: center; width: 70px; padding: 2px;">{p["name"]}<br>{lbl}</div>')).add_to(res_map)
 
-st_folium(res_map, width=1100, height=600, key=f"res_{st.session_state.map_version}")
+st_folium(res_map, width=1100, height=600, key=f"res_v{st.session_state.map_version}")
