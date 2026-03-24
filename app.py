@@ -2,11 +2,10 @@ import streamlit as st
 import folium, requests, math, pandas as pd
 from streamlit_folium import st_folium
 from geopy.distance import geodesic
-from geopy.geocoders import Nominatim
 from folium.features import DivIcon
 
 # --- 1. SETTINGS & RF PHYSICS ---
-st.set_page_config(layout="wide", page_title="DJI M4TD Strategic Planner")
+st.set_page_config(layout="wide", page_title="DJI M4TD Vertical Planner")
 
 TX_POWER = 33.0     
 REQD_SIGNAL = -90.0 
@@ -14,7 +13,7 @@ FREQ = 2.4
 D_STEP = 800        
 
 # Initialize Session State
-if 'center' not in st.session_state: st.session_state.center = [34.066, -84.677] # Default Acworth area
+if 'center' not in st.session_state: st.session_state.center = [34.065, -84.677]
 if 'vault' not in st.session_state: st.session_state.vault = []
 if 'manual_obs' not in st.session_state: st.session_state.manual_obs = []
 if 'staged_obs' not in st.session_state: st.session_state.staged_obs = None
@@ -32,7 +31,7 @@ def get_elev_msl(lat, lon):
 def calculate_rf(dist_ft, h_tx, h_rx, obs_msl):
     dist_km = dist_ft / 3280.84
     fspl = 20 * math.log10(max(0.01, dist_km)) + 20 * math.log10(FREQ) + 92.45
-    rssi_base = TX_POWER - fspl
+    rssi_base = 33.0 - fspl
     mid_dist_m = (dist_ft / 2) * 0.3048
     h_clearance = (h_tx + (h_rx - h_tx) * 0.5) - obs_msl
     v = -h_clearance * math.sqrt(2 / (0.125 * mid_dist_m))
@@ -42,74 +41,56 @@ def calculate_rf(dist_ft, h_tx, h_rx, obs_msl):
 # --- 3. UI SIDEBAR ---
 with st.sidebar:
     st.title("🛰️ Site Loadout")
+    query = st.text_input("1. Find Site (Address or Lat/Lon)", placeholder="Acworth, GA or 34.0, -84.6")
     
-    query = st.text_input("1. Find Site (Address or Lat, Lon)", placeholder="e.g. 4415 Center St, Acworth, GA")
-    
-    if st.button("📍 Locate & Fetch Boundary"):
-        try:
-            # FIX: Only try float conversion if a comma exists AND it looks like numbers
-            is_coord = False
-            if "," in query:
-                parts = query.split(",")
-                try:
-                    lat, lon = float(parts[0]), float(parts[1])
-                    st.session_state.center = [lat, lon]
-                    is_coord = True
-                except ValueError:
-                    is_coord = False # It's a street address with a comma (e.g. "Acworth, GA")
-
-            if not is_coord:
-                # Use ArcGIS for Address strings
-                arcgis_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={query}&maxLocations=1"
-                res = requests.get(arcgis_url, timeout=5).json()
-                if res.get('candidates'):
-                    loc = res['candidates'][0]['location']
-                    st.session_state.center = [loc['y'], loc['x']]
-                else:
-                    st.error("Address not found in database.")
-
-            # Fetch Boundary Polygon
+    if st.button("📍 Locate Dock"):
+        if "," in query:
             try:
-                geo = Nominatim(user_agent="dji_m4td_survey_tool_2026")
-                res = geo.reverse(st.session_state.center, timeout=5)
-                if res:
-                    osm_id = res.raw.get('osm_id')
-                    osm_type = res.raw.get('osm_type')[0].upper()
-                    poly_url = f"https://nominatim.openstreetmap.org/details?osmtype={osm_type}&osmid={osm_id}&format=json&polygon_geojson=1"
-                    p_res = requests.get(poly_url, timeout=5).json()
-                    city_name = res.raw.get('address', {}).get('city') or res.raw.get('address', {}).get('town', "Area Found")
-                    st.session_state.jurisdiction = {"name": city_name, "poly": p_res.get('geometry')}
-                    st.toast(f"Matched Jurisdiction: {city_name}")
-            except: 
-                st.session_state.jurisdiction = {"name": "Manual Scan Only", "poly": None}
-            
-            st.session_state.map_v += 1
-            st.rerun()
-        except Exception as e:
-            st.error(f"Search error: {e}")
+                lat, lon = map(float, query.split(","))
+                st.session_state.center = [lat, lon]
+            except: st.error("Invalid Lat/Lon")
+        else:
+            arc_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={query}&maxLocations=1"
+            res = requests.get(arc_url).json()
+            if res.get('candidates'):
+                loc = res['candidates'][0]['location']
+                st.session_state.center = [loc['y'], loc['x']]
+        
+        st.session_state.manual_obs = []
+        st.session_state.vault = []
+        st.session_state.map_v += 1
+        st.rerun()
 
     st.divider()
-    st.header("2. Manual Obstacle")
+    st.header("2. Edit Obstacle")
     if st.session_state.staged_obs:
-        st.warning(f"Editing: {st.session_state.staged_obs['dir']} @ {int(st.session_state.staged_obs['dist'])}ft")
-        verified_msl = st.number_input("Adjust Top MSL (ft)", value=st.session_state.staged_obs['msl'], min_value=0.0)
-        if st.button("✔️ Lock Obstacle"):
-            st.session_state.staged_obs['msl'] = verified_msl
+        st.warning(f"Target: {st.session_state.staged_obs['dir']} @ {int(st.session_state.staged_obs['dist'])}ft")
+        
+        # STACK LOGIC
+        g_msl = st.number_input("Ground MSL (Auto)", value=st.session_state.staged_obs['ground'])
+        b_msl = st.number_input("Top of Structure MSL", value=g_msl + 40.0)
+        ant_ext = st.number_input("Antenna/Mast above Structure (ft)", value=0.0)
+        
+        final_tip_msl = b_msl + ant_ext
+        st.info(f"**Total Tip MSL: {final_tip_msl} ft**")
+        
+        if st.button("✔️ Lock Into Scan"):
+            st.session_state.staged_obs['msl'] = final_tip_msl
             st.session_state.manual_obs.append(st.session_state.staged_obs)
             st.session_state.staged_obs = None
             st.rerun()
         if st.button("❌ Cancel"):
             st.session_state.staged_obs = None
             st.rerun()
-    else: st.caption("Click map to select a building/tree.")
+    else: st.caption("Click map to define an obstacle.")
 
     st.divider()
-    ant_h = st.number_input("Antenna AGL (ft)", 35.0)
-    drone_h = st.slider("Mission Alt (ft AGL)", 100, 400, 300)
-    clutter = st.slider("Global Clutter (ft)", 0, 100, 60)
+    ant_h = st.number_input("Dock Antenna Height AGL (ft)", 35.0)
+    drone_h = st.slider("Drone Mission Alt (ft AGL)", 100, 400, 300)
+    clutter = st.slider("Global Tree Buffer (ft)", 0, 100, 60)
     
     if st.button("🚀 RUN STRATEGIC SCAN"):
-        with st.spinner("Analyzing Paths..."):
+        with st.spinner("Analyzing Path Physics..."):
             dock_g = get_elev_msl(st.session_state.center[0], st.session_state.center[1])
             h_tx, h_rx = dock_g + ant_h + 15, dock_g + drone_h
             
@@ -122,9 +103,9 @@ with st.sidebar:
                     pt = geodesic(feet=d).destination(st.session_state.center, ang)
                     this_coord = [pt.latitude, pt.longitude]
                     obs_msl = get_elev_msl(pt.latitude, pt.longitude) + clutter
-                    for m_ob in st.session_state.manual_obs:
-                        if m_ob['dir'] == name and abs(m_ob['dist'] - d) < 600:
-                            obs_msl = max(obs_msl, m_ob['msl'])
+                    for m in st.session_state.manual_obs:
+                        if m['dir'] == name and abs(m['dist'] - d) < 600:
+                            obs_msl = max(obs_msl, m['msl'])
                     rssi = calculate_rf(d, h_tx, h_rx, obs_msl)
                     color = "#00FF00" if rssi > -80 else "#FFA500" if rssi > -88 else "#FF0000"
                     path.append({"coords": [last_coord, this_coord], "color": color})
@@ -136,38 +117,31 @@ with st.sidebar:
 
 # --- 4. MAP RENDERING ---
 st.subheader(f"Jurisdiction: {st.session_state.jurisdiction['name']}")
-m = folium.Map(location=st.session_state.center, zoom_start=15, 
+m = folium.Map(location=st.session_state.center, zoom_start=17, 
                tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
 
-# Home Point & Scan Lines
+# Visual Assets
 folium.Marker(st.session_state.center, icon=folium.Icon(color='blue', icon='home')).add_to(m)
-for path in st.session_state.vault:
-    for seg in path:
-        folium.PolyLine(seg['coords'], color=seg['color'], weight=4, opacity=0.8).add_to(m)
-
-# 📡 Distance Rings (Bold White)
 for mi in [1, 2, 3]:
     folium.Circle(st.session_state.center, radius=mi*1609.34, color='white', weight=2, fill=False, opacity=0.5).add_to(m)
     p = geodesic(miles=mi).destination(st.session_state.center, 0)
     folium.Marker([p.latitude, p.longitude], icon=DivIcon(html=f'<div style="color:white; font-size:11px; font-weight:bold; background:rgba(0,0,0,0.6); padding:2px; border-radius:3px;">{mi} MILE</div>')).add_to(m)
 
-# 🔴 Jurisdiction Boundary (RED)
-if st.session_state.jurisdiction['poly']:
-    folium.GeoJson(st.session_state.jurisdiction['poly'], name="City Boundary",
-                   style_function=lambda x: {'color': 'red', 'fillColor': 'red', 'weight': 3, 'fillOpacity': 0.15}).add_to(m)
+for path in st.session_state.vault:
+    for seg in path:
+        folium.PolyLine(seg['coords'], color=seg['color'], weight=4, opacity=0.8).add_to(m)
 
-# Locked Obstacles
 for o in st.session_state.manual_obs:
-    folium.Marker(o['coords'], tooltip=f"VERIFIED: {o['msl']}ft", icon=folium.Icon(color='orange', icon='tree', prefix='fa')).add_to(m)
+    folium.Marker(o['coords'], tooltip=f"TIP: {o['msl']}ft", icon=folium.Icon(color='orange', icon='tree', prefix='fa')).add_to(m)
 
-# INTERACTION
+# Click Capture
 out = st_folium(m, width=1100, height=650, key=f"map_v{st.session_state.map_v}")
 
 if out and out.get("last_clicked"):
     c_lat, c_lon = out["last_clicked"]["lat"], out["last_clicked"]["lng"]
     dist = geodesic(st.session_state.center, (c_lat, c_lon)).feet
     
-    # Calc Direction
+    # Calc Bearing
     dL = math.radians(c_lon - st.session_state.center[1])
     y = math.sin(dL) * math.cos(math.radians(c_lat))
     x = math.cos(math.radians(st.session_state.center[0])) * math.sin(math.radians(c_lat)) - \
@@ -176,7 +150,8 @@ if out and out.get("last_clicked"):
     dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
     snap_dir = dirs[int((brng + 11.25) / 22.5) % 16]
     
+    # Stage with Ground MSL
     st.session_state.staged_obs = {
-        "dist": dist, "msl": get_elev_msl(c_lat, c_lon), "dir": snap_dir, "coords": [c_lat, c_lon]
+        "dist": dist, "ground": get_elev_msl(c_lat, c_lon), "dir": snap_dir, "coords": [c_lat, c_lon]
     }
     st.rerun()
