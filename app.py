@@ -11,18 +11,17 @@ st.set_page_config(layout="wide", page_title="DJI M4TD Multi-Obstacle Planner")
 dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
 if 'vault' not in st.session_state:
-    # Now storing a LIST of obstacles for each direction
     st.session_state.vault = {d: [] for d in dirs}
 if 'center_coord' not in st.session_state:
     st.session_state.center_coord = [33.66, -84.01]
 if 'last_click_dist' not in st.session_state:
     st.session_state.last_click_dist = 0.0
 
-# --- 2. LOGIC FUNCTIONS ---
+# --- 2. FUNCTIONS ---
 def search():
     if st.session_state.addr_input:
         try:
-            loc = Nominatim(user_agent="dji_multi_obs").geocode(st.session_state.addr_input)
+            loc = Nominatim(user_agent="dji_multi_fix_v1").geocode(st.session_state.addr_input)
             if loc: st.session_state.center_coord = [loc.latitude, loc.longitude]
         except: st.error("Search error.")
 
@@ -33,7 +32,7 @@ def get_city(lat, lon):
         return res.get('geojson')
     except: return None
 
-# --- 3. UI & SIDEBAR ---
+# --- 3. UI & SEARCH ---
 st.title("📡 DJI M4TD Multi-Obstacle Precision Planner")
 st.text_input("Search Address", key="addr_input", on_change=search)
 
@@ -56,24 +55,26 @@ with st.sidebar:
     if st.button(f"➕ Add Obstacle to {target_dir}"):
         new_obs = {"dist": round(st.session_state.last_click_dist, 1), "h": calc_h}
         st.session_state.vault[target_dir].append(new_obs)
-        st.success(f"Added to {target_dir} list!")
+        st.success(f"Added to {target_dir}!")
 
     st.divider()
-    st.subheader("Current Obstacles")
+    st.subheader("Review Obstacles")
     for d in dirs:
         if st.session_state.vault[d]:
-            st.write(f"**{d}:** {len(st.session_state.vault[d])} obstacles")
-            if st.button(f"🗑️ Clear {d}", key=f"clr_{d}"):
+            count = len(st.session_state.vault[d])
+            if st.button(f"🗑️ Clear {d} ({count} items)", key=f"clr_{d}"):
                 st.session_state.vault[d] = []
                 st.rerun()
 
-    if st.button("🚨 RESET ENTIRE SURVEY"):
+    if st.button("🚨 RESET ALL"):
         st.session_state.vault = {d: [] for d in dirs}
         st.rerun()
 
-# --- 4. SATELLITE MAP ---
+# --- 4. INTERACTIVE SATELLITE MAP ---
+# Key resets when coords change
 m_k = f"m_{st.session_state.center_coord[0]}_{st.session_state.center_coord[1]}"
-m = folium.Map(location=st.session_state.center_coord, zoom_start=19, tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
+m = folium.Map(location=st.session_state.center_coord, zoom_start=19, 
+               tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
 folium.Marker(st.session_state.center_coord, icon=folium.Icon(color='red')).add_to(m)
 
 out = st_folium(m, width=900, height=500, key=m_k)
@@ -86,34 +87,35 @@ if out and out.get("last_clicked"):
         st.rerun()
     else:
         st.session_state.last_click_dist = nd
-        st.write(f"Detected Distance: **{int(nd)} ft**. Enter MSL and click 'Add'.")
+        st.write(f"Distance: **{int(nd)} ft**. Enter MSL and click Add.")
 
-# --- 5. CALCULATION (WORST-CASE ANALYSIS) ---
-st.subheader("Final Range Analysis (Worst-Case Obstruction)")
+# --- 5. CALCULATION (CRASH-PROOFED) ---
+st.subheader("Final Range Analysis")
 rf_pts = []
 max_ft = 3.5 * 5280
 bearings = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
 
 for d, ang in bearings.items():
-    direction_limits = [max_ft] # Default to 3.5 miles
+    direction_limits = [max_ft] # Starting distance
     
-    # Check every obstacle in this direction
-    for obs in st.session_state.vault[d]:
-        h, dist = obs["h"], obs["dist"]
+    # CRASH-PROOF GUARD: Only iterate if there are items in the vault
+    current_obs_list = st.session_state.vault.get(d, [])
+    
+    for obs in current_obs_list:
+        h = obs.get("h", 60.0)
+        dist = obs.get("dist", 150.0)
         
         if h <= ant_total:
             limit = max_ft
         else:
-            # How far can we go before THIS specific obstacle blocks us?
+            # LOS math
             limit = ((d_alt - ant_total) * dist) / (h - ant_total)
-            limit = max(limit, dist) # Can't fly through the tree
+            limit = max(limit, dist) # Can't fly behind the tree if it's blocking
             
         direction_limits.append(limit)
     
-    # THE DECIDING FACTOR: The shortest limit wins
+    # Pick the most restrictive obstacle
     final_d = min(direction_limits)
-    final_d = min(final_d, max_ft)
-    
     dest = geodesic(feet=final_d).destination(st.session_state.center_coord, ang)
     rf_pts.append({"lat": dest.latitude, "lon": dest.longitude, "name": d, "dist": final_d})
 
