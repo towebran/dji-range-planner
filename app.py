@@ -12,17 +12,14 @@ TX_EIRP = 33.0
 THRESHOLD_LOST = -92.0 
 EARTH_K = 1.333        
 
-# Ensure all session states exist
-for key, val in {
-    'center': [33.6644, -84.0113],
-    'dock_confirmed': False,
-    'dock_stack': {"b_height": 32.0, "ant_h": 15.0, "total_msl": 0.0, "ground": 0.0},
-    'vault': [],
-    'poly_coords': [],
-    'manual_obs': [],
-    'map_v': 1
-}.items():
-    if key not in st.session_state: st.session_state[key] = val
+# Initialize Session State
+if 'center' not in st.session_state: st.session_state.center = [33.6644, -84.0113]
+if 'dock_confirmed' not in st.session_state: st.session_state.dock_confirmed = False
+if 'dock_stack' not in st.session_state: st.session_state.dock_stack = {"b_height": 32.0, "ant_h": 15.0, "total_msl": 0.0, "ground": 0.0}
+if 'vault' not in st.session_state: st.session_state.vault = []
+if 'poly_coords' not in st.session_state: st.session_state.poly_coords = []
+if 'manual_obs' not in st.session_state: st.session_state.manual_obs = []
+if 'map_id' not in st.session_state: st.session_state.map_id = 0 # FORCING MAP RESET
 
 # --- 2. ENGINES ---
 def get_elev_msl(lat, lon):
@@ -49,26 +46,16 @@ def calculate_surgical_link(dist_ft, h_tx, h_rx, terrain_msl, obstacles):
     color = "#00FF00" if rssi > -82 else "#FFA500" if rssi > THRESHOLD_LOST else "#FF0000"
     return color, 4 if color == "#00FF00" else 2
 
-def generate_pdf():
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("helvetica", "B", 16); pdf.cell(0, 10, "DJI M4TD SITE SURVEY REPORT", ln=True, align='C')
-    pdf.set_font("helvetica", "", 10); pdf.cell(0, 10, f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True)
-    pdf.ln(5); pdf.set_font("helvetica", "B", 12); pdf.cell(0, 10, "DOCK CONFIGURATION", ln=True)
-    pdf.set_font("helvetica", "", 10)
-    pdf.cell(0, 8, f"Location: {st.session_state.center[0]:.6f}, {st.session_state.center[1]:.6f}", ln=True)
-    pdf.cell(0, 8, f"Total Tip MSL: {st.session_state.dock_stack['total_msl']} ft", ln=True)
-    return pdf.output()
-
 # --- 3. UI SIDEBAR ---
 with st.sidebar:
     st.title("🛡️ M4TD Tactical Planner")
     
+    # SEARCH & REFINE
     if not st.session_state.dock_confirmed:
-        st.header("Step 1: Set Dock Location")
-        query = st.text_input("Find Site (Address or Lat, Lon)", placeholder="Acworth, GA or 34.0, -84.6")
+        st.header("Step 1: Locate & Refine Dock")
+        query = st.text_input("1. Type Address or Lat, Lon", placeholder="Acworth, GA or 34.0, -84.6")
         
-        if st.button("📍 Search Location"):
+        if st.button("📍 Jump to Location"):
             if "," in query:
                 try:
                     lat, lon = map(float, query.split(","))
@@ -80,12 +67,16 @@ with st.sidebar:
                 if res.get('candidates'):
                     loc = res['candidates'][0]['location']
                     st.session_state.center = [loc['y'], loc['x']]
-            st.session_state.map_v += 1
+                else:
+                    st.error("Address not found.")
+            
+            # FORCE RE-CENTER BY CHANGING MAP ID
+            st.session_state.map_id += 1
             st.rerun()
         
-        st.warning("👉 Move the Blue Marker by clicking on the map.")
+        st.info("2. Now **CLICK** the map to refine the Blue Marker exactly.")
         
-        # Vertical Stack
+        # Heights
         d_ground = get_elev_msl(st.session_state.center[0], st.session_state.center[1])
         b_h = st.number_input("Building Height (ft)", value=st.session_state.dock_stack['b_height'])
         a_h = st.number_input("Antenna Height (ft)", value=st.session_state.dock_stack['ant_h'])
@@ -96,13 +87,11 @@ with st.sidebar:
             st.rerun()
 
     else:
-        st.header("Step 2: Field Survey")
+        st.header("Step 2: Survey Obstacles")
         if st.button("🚨 CLEAR ALL DATA"):
             st.session_state.manual_obs = []; st.session_state.vault = []; st.session_state.poly_coords = []
             st.session_state.dock_confirmed = False
             st.rerun()
-        
-        st.download_button("📥 DOWNLOAD PDF", generate_pdf(), "Report.pdf", "application/pdf")
         
         st.divider()
         drone_agl = st.selectbox("Drone Mission Alt (ft AGL)", [200, 400], index=0)
@@ -127,39 +116,42 @@ with st.sidebar:
                 st.rerun()
 
 # --- 4. MAP RENDERING ---
-m = folium.Map(location=st.session_state.center, zoom_start=18, tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
+m = folium.Map(location=st.session_state.center, zoom_start=18, 
+               tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', 
+               attr='Google')
+
 folium.Marker(st.session_state.center, icon=folium.Icon(color='blue', icon='home')).add_to(m)
 
+# Distance Polygon
 if st.session_state.poly_coords:
     folium.Polygon([p['coord'] for p in st.session_state.poly_coords], color="#00FF00", fill=True, fill_opacity=0.2).add_to(m)
     for p in st.session_state.poly_coords:
         folium.Marker(p['coord'], icon=DivIcon(html=f'<div style="color:white; background:rgba(0,0,0,0.6); padding:2px; font-size:10px;">{round(p["dist"]/5280, 2)}mi</div>')).add_to(m)
 
+# Signal Lines
 for path in st.session_state.vault:
     for seg in path:
         folium.PolyLine(seg['coords'], color=seg['color'], weight=seg['weight'], opacity=0.8).add_to(m)
 
+# Obstacle Flags
 for ob in st.session_state.manual_obs:
     c = "green" if ob['type'] == "Tree" else "red"
     folium.Marker(ob['coords'], icon=folium.DivIcon(html=f"""<div style="background-color:{c}; border-radius:50%; width:25px; height:25px; display:flex; align-items:center; justify-content:center; color:white; font-weight:bold; border:2px solid white;">{ob['id']}</div>""")).add_to(m)
 
-out = st_folium(m, width=1100, height=650, key=f"v{st.session_state.map_v}")
+# HANDLE ALL CLICKS
+out = st_folium(m, width=1100, height=650, key=f"map_run_{st.session_state.map_id}")
 
 if out and out.get("last_clicked"):
     lat, lon = out["last_clicked"]["lat"], out["last_clicked"]["lng"]
     if not st.session_state.dock_confirmed:
-        # Step 1: Manual Refinement of Dock
+        # STEP 1 REFINEMENT
         st.session_state.center = [lat, lon]
-        st.session_state.map_v += 1
         st.rerun()
     else:
-        # Step 2: Obstacle Marking
+        # STEP 2 OBSTACLE MARKING
         new_id = len(st.session_state.manual_obs) + 1
         st.session_state.manual_obs.append({
-            "id": new_id, 
-            "coords": [lat, lon], 
-            "msl": get_elev_msl(lat, lon) + 50.0, 
-            "type": "Tree", 
+            "id": new_id, "coords": [lat, lon], "msl": get_elev_msl(lat, lon) + 50.0, "type": "Tree", 
             "dist": int(geodesic(st.session_state.center, (lat, lon)).feet)
         })
         st.rerun()
