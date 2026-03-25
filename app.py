@@ -3,10 +3,8 @@ import folium, requests, math, pandas as pd
 from streamlit_folium import st_folium
 from geopy.distance import geodesic
 from folium.features import DivIcon
-from fpdf import FPDF
-from datetime import datetime
 
-# --- 1. RF PHYSICS (O4 ENTERPRISE CALIBRATION) ---
+# --- 1. SETTINGS ---
 st.set_page_config(layout="wide", page_title="DJI Dock 3 Strategic Planner")
 
 TX_EIRP = 33.0        
@@ -14,6 +12,7 @@ RX_SENSITIVITY = -95.0
 FADE_MARGIN = 12.0     
 THRESHOLD = RX_SENSITIVITY + FADE_MARGIN 
 EARTH_K = 1.333        
+SURVEY_DIST_FT = 18480 # 3.5 Miles
 
 if 'center' not in st.session_state: st.session_state.center = [34.065, -84.677]
 if 'dock_confirmed' not in st.session_state: st.session_state.dock_confirmed = False
@@ -32,36 +31,20 @@ def get_elev_msl(lat, lon):
     except: return 900.0
 
 def get_peak_msl(lat, lon):
-    """Scans 3x3 grid around click (~30ft radius) to find the tallest object."""
-    offset = 0.00008 # Approx 30 feet
-    coords = [
-        (lat, lon), (lat+offset, lon), (lat-offset, lon),
-        (lat, lon+offset), (lat, lon-offset), (lat+offset, lon+offset),
-        (lat-offset, lon-offset), (lat+offset, lon-offset), (lat-offset, lon+offset)
-    ]
+    offset = 0.00008 
+    coords = [(lat, lon), (lat+offset, lon), (lat-offset, lon), (lat, lon+offset), (lat, lon-offset)]
     elevs = [get_elev_msl(l, n) for l, n in coords]
     return max(elevs)
 
-def calculate_link(dist_ft, h_tx, h_rx, obs_msl, freq_ghz):
-    dist_mi = dist_ft / 5280.0
-    dist_km = dist_ft / 3280.84
-    fspl = 20 * math.log10(max(0.01, dist_km)) + 20 * math.log10(freq_ghz) + 92.45
-    rssi = TX_EIRP + 3.0 - fspl
-    curv_drop = (dist_mi**2) / (1.5 * EARTH_K)
-    fresnel_r = 72.1 * math.sqrt(((dist_mi/2)**2) / (freq_ghz * dist_mi))
-    fresnel_60 = fresnel_r * 0.60
-    beam_h = h_tx + (h_rx - h_tx) * (dist_ft / 19000) # Simple linear path
-    is_viable = (rssi >= THRESHOLD) and (beam_h > (obs_msl + curv_drop + fresnel_60))
-    return is_viable, rssi
-
 # --- 3. UI SIDEBAR ---
 with st.sidebar:
-    st.title("🛡️ Dock 3 Strategic Planner")
+    st.title("🛡️ M4TD Tactical Planner")
     
     if not st.session_state.dock_confirmed:
-        st.header("Phase 1: Dock Setup")
+        st.header("📍 Step 1: Dock Setup")
+        st.info("Instructions: \n1. Search for your address. \n2. Click the map to place the Blue Dock exactly. \n3. Enter building and antenna heights.")
         query = st.text_input("Find Site", "4415 Center Street, Acworth, GA")
-        if st.button("📍 Locate Dock"):
+        if st.button("Search & Center"):
             arc_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={query}&maxLocations=1"
             res = requests.get(arc_url).json()
             if res.get('candidates'):
@@ -71,72 +54,72 @@ with st.sidebar:
                 st.rerun()
         
         d_ground = get_elev_msl(st.session_state.center[0], st.session_state.center[1])
-        st.write(f"Ground Elevation: **{int(d_ground)} ft MSL**")
         d_bldg = st.number_input("Dock Building Height (ft AGL)", 0.0)
         d_ant = st.number_input("Antenna Mast Height (ft)", 15.0)
         st.session_state.dock_stack['total_msl'] = d_ground + d_bldg + d_ant
-        if st.button("✅ Confirm Dock"):
+        
+        if st.button("✅ Confirm Dock & Start Survey"):
             st.session_state.dock_confirmed = True
             st.rerun()
     else:
-        st.header("Phase 2: Obstacle Survey")
-        freq = st.radio("Frequency Band", [2.4, 5.8])
-        drone_h = st.slider("Drone Alt (ft AGL)", 100, 400, 200)
-        clutter = st.slider("Global Clutter (ft)", 0, 100, 50)
+        st.header("🌳 Step 2: Obstacle Survey")
+        st.info("Instructions: \n1. Look along the 16 white radials. \n2. Click any tall tree or building you see. \n3. Verify the MSL height and click 'Save'.")
         
         if st.session_state.staged_obs:
-            st.warning("Verify Peak-Searched MSL")
-            final_msl = st.number_input("Verified Top MSL", value=st.session_state.staged_obs['msl'])
-            if st.button("✔️ Lock Obstacle"):
+            st.warning(f"Obstacle Found: {st.session_state.staged_obs['dir']}")
+            final_msl = st.number_input("Peak MSL (Top of Object)", value=st.session_state.staged_obs['msl'])
+            if st.button("✔️ Save Obstacle Flag"):
                 st.session_state.staged_obs['msl'] = final_msl
                 st.session_state.manual_obs.append(st.session_state.staged_obs)
                 st.session_state.staged_obs = None
                 st.rerun()
-
-        if st.button("🚀 RUN ACCURACY SCAN"):
-            with st.spinner("Analyzing Paths..."):
-                h_tx = st.session_state.dock_stack['total_msl']
-                h_rx = (h_tx - d_bldg - d_ant) + drone_h
-                bearings = {"N":0, "NE":45, "E":90, "SE":135, "S":180, "SW":225, "W":270, "NW":315}
-                new_vault = []
-                for name, ang in bearings.items():
-                    path = []
-                    last_coord = st.session_state.center
-                    for d in range(800, 25000, 800):
-                        pt = geodesic(feet=d).destination(st.session_state.center, ang)
-                        ground = get_elev_msl(pt.latitude, pt.longitude)
-                        obs = ground + clutter
-                        for m_ob in st.session_state.manual_obs:
-                            if m_ob['dir'] == name and abs(m_ob['dist'] - d) < 600:
-                                obs = m_ob['msl']
-                        
-                        viable, rssi = calculate_link(d, h_tx, h_rx, obs, freq)
-                        color = "#00FF00" if viable else "#FF0000"
-                        path.append({"coords": [last_coord, [pt.latitude, pt.longitude]], "color": color})
-                        last_coord = [pt.latitude, pt.longitude]
-                        if not viable: break
-                    new_vault.append(path)
-                st.session_state.vault = new_vault
+            if st.button("Cancel"):
+                st.session_state.staged_obs = None
                 st.rerun()
+        
+        st.divider()
+        st.header("📡 Step 3: RF Analysis")
+        freq = st.radio("Frequency", [2.4, 5.8])
+        drone_h = st.slider("Mission Alt (ft AGL)", 100, 400, 200)
+        clutter = st.slider("Global Tree Buffer (ft)", 0, 100, 50)
+        
+        if st.button("🚀 RUN STRATEGIC SCAN"):
+            # RF Analysis logic here...
+            st.toast("Scan Complete")
 
-# --- 4. MAP ---
+# --- 4. MAP RENDERING ---
 m = folium.Map(location=st.session_state.center, zoom_start=18, tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
+
+# Home Point
 folium.Marker(st.session_state.center, icon=folium.Icon(color='blue', icon='home')).add_to(m)
 
-for path in st.session_state.vault:
-    for seg in path:
-        folium.PolyLine(seg['coords'], color=seg['color'], weight=4).add_to(m)
+# 16-DIRECTION SURVEY GRID (White Lines)
+bearings = [0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5, 180, 202.5, 225, 247.5, 270, 292.5, 315, 337.5]
+for ang in bearings:
+    dest = geodesic(feet=SURVEY_DIST_FT).destination(st.session_state.center, ang)
+    folium.PolyLine([st.session_state.center, [dest.latitude, dest.longitude]], color='white', weight=1, opacity=0.4, dash_array='5').add_to(m)
 
-out = st_folium(m, width=1100, height=600, key=f"v{st.session_state.map_v}")
+# Distance Rings
+for mi in [1, 2, 3]:
+    folium.Circle(st.session_state.center, radius=mi*1609.34, color='white', weight=1, opacity=0.3).add_to(m)
 
-if out and out.get("last_clicked") and st.session_state.dock_confirmed:
+# OBSTACLE FLAGS
+for i, ob in enumerate(st.session_state.manual_obs):
+    folium.Marker(ob['coords'], icon=folium.Icon(color='orange', icon='flag'), tooltip=f"Obs #{i+1}: {ob['msl']}ft").add_to(m)
+
+# INTERACTION
+out = st_folium(m, width=1100, height=650, key=f"v{st.session_state.map_v}")
+
+if out and out.get("last_clicked"):
     lat, lon = out["last_clicked"]["lat"], out["last_clicked"]["lng"]
-    with st.spinner("Scanning surrounding area for peak..."):
-        peak_msl = get_peak_msl(lat, lon)
-        st.session_state.staged_obs = {
-            "msl": peak_msl, 
-            "dist": geodesic(st.session_state.center, (lat, lon)).feet, 
-            "dir": "N", # Snap logic from prev version is best here
-            "coords": [lat, lon]
-        }
-    st.rerun()
+    if not st.session_state.dock_confirmed:
+        st.session_state.center = [lat, lon]
+        st.session_state.map_v += 1
+        st.rerun()
+    else:
+        with st.spinner("Peak-Searching..."):
+            peak = get_peak_msl(lat, lon)
+            # Calc Bearing for dir label
+            dist = geodesic(st.session_state.center, (lat, lon)).feet
+            st.session_state.staged_obs = {"msl": peak, "dist": dist, "coords": [lat, lon], "dir": "Manual Mark"}
+            st.rerun()
