@@ -13,7 +13,7 @@ if 'manual_obs' not in st.session_state: st.session_state.manual_obs = []
 if 'vault' not in st.session_state: st.session_state.vault = []
 if 'map_key' not in st.session_state: st.session_state.map_key = 0
 
-# --- 2. CALLBACKS (The Secret to the Map Fix) ---
+# --- 2. CALLBACKS ---
 def handle_search():
     query = st.session_state.search_query
     if "," in query:
@@ -27,7 +27,6 @@ def handle_search():
         if res.get('candidates'):
             loc = res['candidates'][0]['location']
             st.session_state.center = [loc['y'], loc['x']]
-    # Incrementing the key forces a clean map redraw
     st.session_state.map_key += 1
 
 # --- 3. RF ENGINE ---
@@ -41,41 +40,34 @@ def get_elev_msl(lat, lon):
 def get_signal_color(dist_ft, h_tx, h_rx, terrain_msl, manual_hits):
     dist_mi = dist_ft / 5280.0
     fspl = 20 * math.log10(max(0.01, dist_ft/3280.84)) + 20 * math.log10(2.4) + 92.45
-    rssi = 36.0 - fspl # EIRP + Gain
-    
+    rssi = 36.0 - fspl
     for m in manual_hits:
         if m['dist'] < dist_ft:
             beam_at_obs = h_tx + (h_rx - h_tx) * (m['dist'] / dist_ft)
             if m['msl'] > beam_at_obs:
                 rssi -= (12.0 if m['type'] == "Tree" else 30.0)
-    
     if terrain_msl > h_rx: rssi -= 20.0
-    if rssi > -82.0: return "#00FF00", 5    # Green
-    if rssi > -90.0: return "#FFA500", 3    # Orange
-    return "#FF0000", 2                    # Red
+    if rssi > -82.0: return "#00FF00", 5
+    if rssi > -90.0: return "#FFA500", 3
+    return "#FF0000", 2
 
 # --- 4. UI SIDEBAR ---
 with st.sidebar:
     st.title("🛰️ Tactical Site Survey")
-    
-    # GLOBAL CONTROLS
     st.header("Global Settings")
     drone_agl = st.selectbox("Drone Alt (ft AGL)", [200, 400])
     clutter_h = st.slider("Global Clutter (Avg Tree Ht)", 0, 150, 80)
-    
     st.divider()
 
     if not st.session_state.dock_confirmed:
         st.header("Step 1: Set Dock")
         st.text_input("Search Address or Lat, Lon", key="search_query")
         st.button("📍 Jump to Site", on_click=handle_search)
-        
         ground = get_elev_msl(st.session_state.center[0], st.session_state.center[1])
         b_h = st.number_input("Bldg Ht (ft)", 32)
         a_h = st.number_input("Ant Ht (ft)", 15)
         dock_msl = ground + b_h + a_h
         st.info(f"Dock Tip: {int(dock_msl)}' MSL")
-        
         if st.button("✅ Confirm Dock"):
             st.session_state.dock_confirmed = True
             st.session_state.dock_msl = dock_msl
@@ -114,17 +106,31 @@ with st.sidebar:
 m = folium.Map(location=st.session_state.center, zoom_start=18, tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
 folium.Marker(st.session_state.center, icon=folium.Icon(color='blue', icon='home')).add_to(m)
 
+# POLYGON & LABELS LOGIC
+if st.session_state.vault:
+    poly_points = []
+    for path in st.session_state.vault:
+        last_seg = path[-1]
+        end_coord = last_seg['coords'][1]
+        poly_points.append(end_coord)
+        
+        # Distance Labels at end of each radial
+        miles = round(last_seg['dist'] / 5280, 2)
+        folium.Marker(end_coord, icon=folium.features.DivIcon(
+            html=f'<div style="color:white; background:rgba(0,0,0,0.6); padding:2px; font-size:10px; border-radius:3px;">{miles}mi</div>'
+        )).add_to(m)
+    
+    # Draw the boundary polygon
+    folium.Polygon(poly_points, color="#00FF00", weight=2, fill=True, fill_opacity=0.1).add_to(m)
+
 for path in st.session_state.vault:
     for seg in path:
         folium.PolyLine(seg['coords'], color=seg['color'], weight=seg['weight']).add_to(m)
-    dist_label = f"{round(path[-1]['dist']/5280, 2)}mi"
-    folium.Marker(path[-1]['coords'][1], icon=folium.features.DivIcon(html=f'<div style="color:white; background:black; padding:2px; font-size:9px;">{dist_label}</div>')).add_to(m)
 
 for ob in st.session_state.manual_obs:
     c = "green" if ob['type'] == "Tree" else "red"
     folium.Marker(ob['coords'], icon=folium.features.DivIcon(html=f'<div style="background:{c}; border-radius:50%; width:22px; height:22px; color:white; text-align:center; font-weight:bold; border:2px solid white; line-height:22px;">{ob["id"]}</div>')).add_to(m)
 
-# FINAL RENDER
 out = st_folium(m, width=1100, height=650, center=st.session_state.center, key=f"map_{st.session_state.map_key}")
 
 if out and out.get("last_clicked") and st.session_state.dock_confirmed:
