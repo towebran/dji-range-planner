@@ -3,3 +3,5 @@ folium
 streamlit-folium
 geopy
 requests
+pandas
+fpdf2
