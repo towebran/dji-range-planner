@@ -6,14 +6,14 @@ import random
 
 st.set_page_config(layout="wide", page_title="DJI M4TD Tactical Planner")
 
-# --- 1. SESSION STATE INITIALIZATION ---
+# --- 1. SESSION STATE ---
 if 'center' not in st.session_state: st.session_state.center = [33.6644, -84.0113]
 if 'dock_confirmed' not in st.session_state: st.session_state.dock_confirmed = False
 if 'manual_obs' not in st.session_state: st.session_state.manual_obs = []
-if 'vault' not in st.session_state: st.session_state.vault = []
+if 'zones' not in st.session_state: st.session_state.zones = {"green": [], "orange": [], "red": []}
 if 'map_key' not in st.session_state: st.session_state.map_key = 0
 
-# --- 2. CALLBACKS ---
+# --- 2. SEARCH CALLBACK ---
 def handle_search():
     query = st.session_state.search_query
     if "," in query:
@@ -37,8 +37,7 @@ def get_elev_msl(lat, lon):
         return float(res.get('value', 900.0))
     except: return 900.0
 
-def get_signal_color(dist_ft, h_tx, h_rx, terrain_msl, manual_hits):
-    dist_mi = dist_ft / 5280.0
+def get_signal_rssi(dist_ft, h_tx, h_rx, terrain_msl, manual_hits):
     fspl = 20 * math.log10(max(0.01, dist_ft/3280.84)) + 20 * math.log10(2.4) + 92.45
     rssi = 36.0 - fspl
     for m in manual_hits:
@@ -47,9 +46,7 @@ def get_signal_color(dist_ft, h_tx, h_rx, terrain_msl, manual_hits):
             if m['msl'] > beam_at_obs:
                 rssi -= (12.0 if m['type'] == "Tree" else 30.0)
     if terrain_msl > h_rx: rssi -= 20.0
-    if rssi > -82.0: return "#00FF00", 5
-    if rssi > -90.0: return "#FFA500", 3
-    return "#FF0000", 2
+    return rssi
 
 # --- 4. UI SIDEBAR ---
 with st.sidebar:
@@ -69,36 +66,40 @@ with st.sidebar:
         dock_msl = ground + b_h + a_h
         st.info(f"Dock Tip: {int(dock_msl)}' MSL")
         if st.button("✅ Confirm Dock"):
-            st.session_state.dock_confirmed = True
-            st.session_state.dock_msl = dock_msl
+            st.session_state.dock_confirmed, st.session_state.dock_msl = True, dock_msl
             st.rerun()
     else:
-        st.header("Step 2: Obstacles")
+        st.header("Step 2: Analysis")
         if st.session_state.manual_obs:
             df = pd.DataFrame(st.session_state.manual_obs)
             edited = st.data_editor(df[['id', 'type', 'msl', 'dist']], hide_index=True)
             for i, row in edited.iterrows():
-                st.session_state.manual_obs[i]['msl'] = row['msl']
-                st.session_state.manual_obs[i]['type'] = row['type']
+                st.session_state.manual_obs[i]['msl'], st.session_state.manual_obs[i]['type'] = row['msl'], row['type']
         
-        if st.button("🚀 SCAN 8-DIRECTIONS"):
+        if st.button("🚀 SCAN MULTI-ZONE"):
             h_tx = st.session_state.dock_msl
-            st.session_state.vault = []
+            st.session_state.zones = {"green": [], "orange": [], "red": []}
             for ang in [0, 45, 90, 135, 180, 225, 270, 315]:
-                path = []
-                last_coord = st.session_state.center
-                for d in range(1500, 19500, 1500):
+                g_pt, o_pt, r_pt = None, None, None
+                for d in range(1000, 20000, 1000):
                     pt = geodesic(feet=d).destination(st.session_state.center, ang)
-                    cur_g = get_elev_msl(pt.latitude, pt.longitude)
-                    color, weight = get_signal_color(d, h_tx, cur_g + drone_agl, cur_g + clutter_h, st.session_state.manual_obs)
-                    path.append({"coords": [last_coord, [pt.latitude, pt.longitude]], "color": color, "weight": weight, "dist": d})
-                    last_coord = [pt.latitude, pt.longitude]
-                    if color == "#FF0000": break
-                st.session_state.vault.append(path)
+                    rssi = get_signal_rssi(d, h_tx, get_elev_msl(pt.latitude, pt.longitude) + drone_agl, get_elev_msl(pt.latitude, pt.longitude) + clutter_h, st.session_state.manual_obs)
+                    
+                    coord = [pt.latitude, pt.longitude]
+                    if rssi > -82.0: g_pt = {"c": coord, "d": d}
+                    elif rssi > -90.0: o_pt = {"c": coord, "d": d}
+                    else: 
+                        r_pt = {"c": coord, "d": d}
+                        break
+                if g_pt: st.session_state.zones['green'].append(g_pt)
+                if o_pt: st.session_state.zones['orange'].append(o_pt)
+                elif g_pt: st.session_state.zones['orange'].append(g_pt) # Fallback to green tip if no orange transition found
+                if r_pt: st.session_state.zones['red'].append(r_pt)
+                elif o_pt: st.session_state.zones['red'].append(o_pt)
             st.rerun()
 
         if st.button("🚨 Reset All"):
-            st.session_state.manual_obs, st.session_state.vault, st.session_state.dock_confirmed = [], [], False
+            st.session_state.manual_obs, st.session_state.zones, st.session_state.dock_confirmed = [], {"green":[],"orange":[],"red":[]}, False
             st.session_state.map_key += 1
             st.rerun()
 
@@ -106,26 +107,13 @@ with st.sidebar:
 m = folium.Map(location=st.session_state.center, zoom_start=18, tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
 folium.Marker(st.session_state.center, icon=folium.Icon(color='blue', icon='home')).add_to(m)
 
-# POLYGON & LABELS LOGIC
-if st.session_state.vault:
-    poly_points = []
-    for path in st.session_state.vault:
-        last_seg = path[-1]
-        end_coord = last_seg['coords'][1]
-        poly_points.append(end_coord)
-        
-        # Distance Labels at end of each radial
-        miles = round(last_seg['dist'] / 5280, 2)
-        folium.Marker(end_coord, icon=folium.features.DivIcon(
-            html=f'<div style="color:white; background:rgba(0,0,0,0.6); padding:2px; font-size:10px; border-radius:3px;">{miles}mi</div>'
-        )).add_to(m)
-    
-    # Draw the boundary polygon
-    folium.Polygon(poly_points, color="#00FF00", weight=2, fill=True, fill_opacity=0.1).add_to(m)
-
-for path in st.session_state.vault:
-    for seg in path:
-        folium.PolyLine(seg['coords'], color=seg['color'], weight=seg['weight']).add_to(m)
+# DRAW ZONES & LABELS
+for color, zone_key, label_bg in [("#FF0000", 'red', "rgba(255,0,0,0.6)"), ("#FFA500", 'orange', "rgba(255,165,0,0.6)"), ("#00FF00", 'green', "rgba(0,255,0,0.4)")]:
+    pts = st.session_state.zones[zone_key]
+    if len(pts) > 2:
+        folium.Polygon([p['c'] for p in pts], color=color, weight=2, fill=True, fill_opacity=0.2).add_to(m)
+        for p in pts:
+            folium.Marker(p['c'], icon=folium.features.DivIcon(html=f'<div style="color:white; background:{label_bg}; padding:1px 3px; font-size:9px; border-radius:2px;">{round(p["d"]/5280, 2)}mi</div>')).add_to(m)
 
 for ob in st.session_state.manual_obs:
     c = "green" if ob['type'] == "Tree" else "red"
