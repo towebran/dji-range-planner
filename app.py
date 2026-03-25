@@ -6,21 +6,23 @@ from folium.features import DivIcon
 from fpdf import FPDF
 from datetime import datetime
 
-# --- 1. SETTINGS & RF PHYSICS ---
+# --- 1. SETTINGS & RF ---
 st.set_page_config(layout="wide", page_title="DJI M4TD Tactical Planner")
-
 TX_EIRP = 33.0        
 THRESHOLD_LOST = -92.0 
 EARTH_K = 1.333        
 
-# Initialize Session State
-if 'center' not in st.session_state: st.session_state.center = [33.6644, -84.0113]
-if 'dock_confirmed' not in st.session_state: st.session_state.dock_confirmed = False
-if 'dock_stack' not in st.session_state: st.session_state.dock_stack = {"b_height": 0.0, "ant_h": 15.0, "total_msl": 0.0, "ground": 0.0}
-if 'vault' not in st.session_state: st.session_state.vault = []
-if 'poly_coords' not in st.session_state: st.session_state.poly_coords = []
-if 'manual_obs' not in st.session_state: st.session_state.manual_obs = []
-if 'map_v' not in st.session_state: st.session_state.map_v = 1
+# Ensure all session states exist
+for key, val in {
+    'center': [33.6644, -84.0113],
+    'dock_confirmed': False,
+    'dock_stack': {"b_height": 32.0, "ant_h": 15.0, "total_msl": 0.0, "ground": 0.0},
+    'vault': [],
+    'poly_coords': [],
+    'manual_obs': [],
+    'map_v': 1
+}.items():
+    if key not in st.session_state: st.session_state[key] = val
 
 # --- 2. ENGINES ---
 def get_elev_msl(lat, lon):
@@ -30,10 +32,10 @@ def get_elev_msl(lat, lon):
         return float(res.get('value', 900.0))
     except: return 900.0
 
-def calculate_surgical_link(dist_ft, h_tx, h_rx, terrain_msl, obstacles, freq=2.4):
+def calculate_surgical_link(dist_ft, h_tx, h_rx, terrain_msl, obstacles):
     dist_km = dist_ft / 3280.84
     dist_mi = dist_ft / 5280.0
-    fspl = 20 * math.log10(max(0.01, dist_km)) + 20 * math.log10(freq) + 92.45
+    fspl = 20 * math.log10(max(0.01, dist_km)) + 20 * math.log10(2.4) + 92.45
     rssi = TX_EIRP + 3.0 - fspl
     curv_drop = (dist_mi**2) / (1.5 * EARTH_K)
     
@@ -56,10 +58,6 @@ def generate_pdf():
     pdf.set_font("helvetica", "", 10)
     pdf.cell(0, 8, f"Location: {st.session_state.center[0]:.6f}, {st.session_state.center[1]:.6f}", ln=True)
     pdf.cell(0, 8, f"Total Tip MSL: {st.session_state.dock_stack['total_msl']} ft", ln=True)
-    if st.session_state.manual_obs:
-        pdf.ln(5); pdf.set_font("helvetica", "B", 12); pdf.cell(0, 10, "OBSTRUCTIONS", ln=True)
-        for ob in st.session_state.manual_obs:
-            pdf.cell(0, 8, f"Flag {ob['id']}: {ob['type']} @ {int(ob['dist'])}ft | MSL: {ob['msl']}ft", ln=True)
     return pdf.output()
 
 # --- 3. UI SIDEBAR ---
@@ -69,35 +67,42 @@ with st.sidebar:
     if not st.session_state.dock_confirmed:
         st.header("Step 1: Set Dock Location")
         query = st.text_input("Find Site (Address or Lat, Lon)", placeholder="Acworth, GA or 34.0, -84.6")
-        if st.button("📍 Search"):
+        
+        if st.button("📍 Search Location"):
             if "," in query:
                 try:
                     lat, lon = map(float, query.split(","))
                     st.session_state.center = [lat, lon]
                 except: st.error("Invalid Lat/Lon")
             else:
-                arc_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={query}&maxLocations=1"
-                res = requests.get(arc_url).json()
+                url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={query}&maxLocations=1"
+                res = requests.get(url).json()
                 if res.get('candidates'):
                     loc = res['candidates'][0]['location']
                     st.session_state.center = [loc['y'], loc['x']]
-            st.session_state.map_v += 1; st.rerun()
+            st.session_state.map_v += 1
+            st.rerun()
         
-        st.info("Instructions: Click the map to precisely move the Blue Dock marker.")
+        st.warning("👉 Move the Blue Marker by clicking on the map.")
+        
+        # Vertical Stack
         d_ground = get_elev_msl(st.session_state.center[0], st.session_state.center[1])
-        b_h = st.number_input("Building Height (ft)", 32.0)
-        a_h = st.number_input("Antenna Height (ft)", 15.0)
+        b_h = st.number_input("Building Height (ft)", value=st.session_state.dock_stack['b_height'])
+        a_h = st.number_input("Antenna Height (ft)", value=st.session_state.dock_stack['ant_h'])
         st.session_state.dock_stack = {"b_height": b_h, "ant_h": a_h, "total_msl": d_ground + b_h + a_h, "ground": d_ground}
         
         if st.button("✅ Confirm Dock Location"):
-            st.session_state.dock_confirmed = True; st.rerun()
+            st.session_state.dock_confirmed = True
+            st.rerun()
+
     else:
         st.header("Step 2: Field Survey")
         if st.button("🚨 CLEAR ALL DATA"):
-            st.session_state.manual_obs = []; st.session_state.vault = []; st.session_state.poly_coords = []; st.rerun()
+            st.session_state.manual_obs = []; st.session_state.vault = []; st.session_state.poly_coords = []
+            st.session_state.dock_confirmed = False
+            st.rerun()
         
-        pdf_data = generate_pdf()
-        st.download_button("📥 DOWNLOAD PDF REPORT", pdf_data, "Site_Report.pdf", "application/pdf")
+        st.download_button("📥 DOWNLOAD PDF", generate_pdf(), "Report.pdf", "application/pdf")
         
         st.divider()
         drone_agl = st.selectbox("Drone Mission Alt (ft AGL)", [200, 400], index=0)
@@ -143,9 +148,18 @@ out = st_folium(m, width=1100, height=650, key=f"v{st.session_state.map_v}")
 if out and out.get("last_clicked"):
     lat, lon = out["last_clicked"]["lat"], out["last_clicked"]["lng"]
     if not st.session_state.dock_confirmed:
+        # Step 1: Manual Refinement of Dock
         st.session_state.center = [lat, lon]
-        st.session_state.map_v += 1; st.rerun()
+        st.session_state.map_v += 1
+        st.rerun()
     else:
+        # Step 2: Obstacle Marking
         new_id = len(st.session_state.manual_obs) + 1
-        st.session_state.manual_obs.append({"id": new_id, "coords": [lat, lon], "msl": get_elev_msl(lat, lon) + 50.0, "type": "Tree", "dist": int(geodesic(st.session_state.center, (lat, lon)).feet)})
+        st.session_state.manual_obs.append({
+            "id": new_id, 
+            "coords": [lat, lon], 
+            "msl": get_elev_msl(lat, lon) + 50.0, 
+            "type": "Tree", 
+            "dist": int(geodesic(st.session_state.center, (lat, lon)).feet)
+        })
         st.rerun()
