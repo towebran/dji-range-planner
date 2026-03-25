@@ -4,18 +4,21 @@ from streamlit_folium import st_folium
 from geopy.distance import geodesic
 from folium.features import DivIcon
 
-# --- 1. RF CONSTANTS ---
-st.set_page_config(layout="wide", page_title="DJI M4TD Terrain Follower")
+# --- 1. RF & PHYSICS CONSTANTS ---
+st.set_page_config(layout="wide", page_title="DJI M4TD Tactical Planner")
 
 TX_EIRP = 33.0        
 MARGIN_SOLID = -82.0   
 MARGIN_DEGRADED = -92.0 
 EARTH_K = 1.333        
+SURVEY_DIST_FT = 18480 
 
+# Initialize State
 if 'center' not in st.session_state: st.session_state.center = [33.6644, -84.0113]
 if 'dock_confirmed' not in st.session_state: st.session_state.dock_confirmed = False
 if 'dock_stack' not in st.session_state: st.session_state.dock_stack = {"b_height": 0.0, "ant_h": 15.0, "total_msl": 0.0, "ground": 0.0}
 if 'vault' not in st.session_state: st.session_state.vault = []
+if 'limit_pts' not in st.session_state: st.session_state.limit_pts = [] # The Red X locations
 if 'manual_obs' not in st.session_state: st.session_state.manual_obs = []
 if 'map_v' not in st.session_state: st.session_state.map_v = 1
 
@@ -28,40 +31,31 @@ def get_elev_msl(lat, lon):
     except: return 900.0
 
 def get_signal_status(dist_ft, h_tx_msl, drone_agl, current_ground_msl, terrain_obs_msl, manual_hits):
-    """
-    Calculates signal based on Terrain Following logic.
-    h_tx_msl: Fixed Dock Antenna height.
-    h_rx_msl: DYNAMIC (Current Ground + Drone AGL).
-    """
+    """Calculates signal based on Terrain Following logic and Path Geometry."""
     dist_mi = dist_ft / 5280.0
     dist_km = dist_ft / 3280.84
-    curv_drop = (dist_mi**2) / (1.5 * EARTH_K)
+    curv_drop = (dist_mi**2) / (1.5 * EARTH_K) # Earth Bulge
     
-    # DYNAMIC DRONE HEIGHT (Terrain Follow)
-    h_rx_msl = current_ground_msl + drone_agl
-    
-    # The signal beam at THIS point in space
-    beam_h = h_tx_msl + (h_rx_msl - h_tx_msl) * 0.5 # Simplified midpoint clearance for this segment
+    h_rx_msl = current_ground_msl + drone_agl # Drone following terrain
     
     best_rssi = -120.0
     for freq in [2.4, 5.8]:
         fspl = 20 * math.log10(max(0.01, dist_km)) + 20 * math.log10(freq) + 92.45
         rssi = TX_EIRP + 3.0 - fspl
+        
+        # Fresnel Radius at this point
         fresnel_r = 72.1 * math.sqrt(((dist_mi/2)**2) / (freq * dist_mi))
         
-        # Check if the Obstacle (MSL) pierces the beam
-        clearance = h_rx_msl - (terrain_obs_msl + curv_drop)
+        # Check Total Obstruction (Terrain + Earth Curve + 60% Fresnel)
+        total_obs_h = terrain_obs_msl + curv_drop + (fresnel_r * 0.6)
         
-        # Terrain Blockage
-        if h_rx_msl < (terrain_obs_msl + curv_drop + (fresnel_r * 0.6)):
-            rssi -= 15.0 
+        if h_rx_msl < total_obs_h:
+            rssi -= 18.0 # Fresnel/Terrain diffraction loss
             
-        # Manual Flag Blockage
         for m in manual_hits:
             m_clearance = h_rx_msl - (m['msl'] + curv_drop)
             if m_clearance < 0: 
-                penalty = (12.0 if freq == 2.4 else 22.0) if m['type'] == "Tree" else 30.0
-                rssi -= penalty
+                rssi -= (12.0 if m['type'] == "Tree" else 35.0)
                     
         if rssi > best_rssi: best_rssi = rssi
 
@@ -71,12 +65,12 @@ def get_signal_status(dist_ft, h_tx_msl, drone_agl, current_ground_msl, terrain_
 
 # --- 3. UI SIDEBAR ---
 with st.sidebar:
-    st.title("🛡️ M4TD Terrain Follower")
+    st.title("🛡️ M4TD Tactical Planner")
     
     if not st.session_state.dock_confirmed:
         st.header("📍 Step 1: Set Dock")
-        query = st.text_input("Search Site", "4415 Center Street, Acworth, GA")
-        if st.button("Search"):
+        query = st.text_input("Find Site", "4415 Center Street, Acworth, GA")
+        if st.button("Locate Dock"):
             arc_url = f"https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?f=json&singleLine={query}&maxLocations=1"
             res = requests.get(arc_url).json()
             if res.get('candidates'):
@@ -89,65 +83,67 @@ with st.sidebar:
         d_bldg = st.number_input("Dock Building Height (ft)", 0.0)
         d_ant = st.number_input("Antenna Height (ft)", 15.0)
         st.session_state.dock_stack = {"b_height": d_bldg, "ant_h": d_ant, "total_msl": d_ground + d_bldg + d_ant, "ground": d_ground}
-        if st.button("✅ Confirm Dock"):
+        if st.button("✅ Confirm Dock Location"):
             st.session_state.dock_confirmed = True
             st.rerun()
     else:
         st.header("🌳 Step 2: Survey")
         drone_agl = st.selectbox("Drone Mission Alt (ft AGL)", [200, 400], index=0)
+        clutter = st.slider("Global Clutter (ft)", 0, 100, 50)
         
         if st.session_state.manual_obs:
             df = pd.DataFrame(st.session_state.manual_obs)
-            # Live Clearance: Drone Height (Ground + AGL) - Obstacle MSL
-            for i, m in enumerate(st.session_state.manual_obs):
-                m_ground = get_elev_msl(m['coords'][0], m['coords'][1])
-                st.session_state.manual_obs[i]['clearance'] = int((m_ground + drone_agl) - m['msl'])
-
-            edited_df = st.data_editor(
-                df[['id', 'type', 'msl', 'clearance']], 
-                column_config={"type": st.column_config.SelectboxColumn("Type", options=["Tree", "Solid"])},
-                hide_index=True
-            )
+            edited_df = st.data_editor(df[['id', 'type', 'msl', 'dist']], 
+                                      column_config={"type": st.column_config.SelectboxColumn("Type", options=["Tree", "Solid"])},
+                                      hide_index=True)
             for i, row in edited_df.iterrows():
                 st.session_state.manual_obs[i]['msl'] = row['msl']
                 st.session_state.manual_obs[i]['type'] = row['type']
 
-        st.divider()
-        st.header("📡 Step 3: Analysis")
-        clutter = st.slider("Global Clutter (ft)", 0, 100, 50)
-        
-        if st.button("🚀 RUN TERRAIN-FOLLOW SCAN"):
-            with st.spinner("Analyzing Variable Altitude Link..."):
+        if st.button("🚀 RUN STRATEGIC SCAN"):
+            with st.spinner("Hunting Obstructions..."):
+                st.session_state.limit_pts = [] # Clear old Xs
                 h_tx = st.session_state.dock_stack['total_msl']
-                
                 bearings = [0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5, 180, 202.5, 225, 247.5, 270, 292.5, 315, 337.5]
                 new_vault = []
+                
                 for ang in bearings:
                     path = []
                     last_coord = st.session_state.center
                     for d in range(800, 20000, 800):
                         pt = geodesic(feet=d).destination(st.session_state.center, ang)
                         current_ground = get_elev_msl(pt.latitude, pt.longitude)
-                        
                         hits = [m for m in st.session_state.manual_obs if geodesic(m['coords'], (pt.latitude, pt.longitude)).feet < 600]
                         
-                        # Logic now uses current_ground to establish drone h_rx
                         color, weight = get_signal_status(d, h_tx, drone_agl, current_ground, current_ground + clutter, hits)
                         path.append({"coords": [last_coord, [pt.latitude, pt.longitude]], "color": color, "weight": weight})
                         last_coord = [pt.latitude, pt.longitude]
-                        if color == "#FF0000": break 
+                        
+                        if color == "#FF0000": # RED LIGHT
+                            st.session_state.limit_pts.append({"coords": [pt.latitude, pt.longitude], "ang": ang})
+                            break 
                     new_vault.append(path)
                 st.session_state.vault = new_vault
                 st.rerun()
 
-# --- 4. MAP ---
+# --- 4. MAP RENDERING ---
 m = folium.Map(location=st.session_state.center, zoom_start=18, tiles='https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', attr='Google')
 folium.Marker(st.session_state.center, icon=folium.Icon(color='blue', icon='home')).add_to(m)
 
+# Draw Scan Path Lines
 for path in st.session_state.vault:
     for seg in path:
         folium.PolyLine(seg['coords'], color=seg['color'], weight=seg['weight'], opacity=0.8).add_to(m)
 
+# DRAW RED "X" ON KILL POINTS
+for x_pt in st.session_state.limit_pts:
+    folium.Marker(
+        x_pt['coords'], 
+        icon=folium.DivIcon(html=f"""<div style="color: red; font-size: 24pt; font-weight: bold; transform: translate(-50%, -50%);">❌</div>"""),
+        tooltip="Critical Obstruction Point"
+    ).add_to(m)
+
+# Draw Manual Flags
 for ob in st.session_state.manual_obs:
     c = "green" if ob['type'] == "Tree" else "red"
     folium.Marker(ob['coords'], icon=folium.DivIcon(html=f"""<div style="background-color: {c}; border-radius: 50%; width: 25px; height: 25px; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; border: 2px solid white;">{ob['id']}</div>""")).add_to(m)
@@ -162,5 +158,5 @@ if out and out.get("last_clicked"):
         st.rerun()
     else:
         new_id = len(st.session_state.manual_obs) + 1
-        st.session_state.manual_obs.append({"id": new_id, "coords": [lat, lon], "msl": get_elev_msl(lat, lon) + 50.0, "type": "Tree", "clearance": 0})
+        st.session_state.manual_obs.append({"id": new_id, "coords": [lat, lon], "msl": get_elev_msl(lat, lon) + 50.0, "type": "Tree", "dist": int(geodesic(st.session_state.center, (lat, lon)).feet)})
         st.rerun()
